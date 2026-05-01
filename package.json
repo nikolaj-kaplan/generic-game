@@ -1,0 +1,16 @@
+{
+  "name": "generic-game",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -n server,client -c cyan,yellow \"npm run dev --prefix server\" \"npm run dev --prefix client\"",
+    "dev:server": "npm run dev --prefix server",
+    "dev:client": "npm run dev --prefix client",
+    "build": "npm run build --prefix client",
+    "start": "fuser -k 3001/tcp 2>/dev/null; npm run build --prefix client && npm run start --prefix server",
+    "install:all": "npm install --prefix server && npm install --prefix client",
+    "logs:clear": "rm -f data/llm-logs/*.json && echo 'LLM logs cleared.'"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
