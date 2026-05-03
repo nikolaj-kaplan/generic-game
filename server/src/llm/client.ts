@@ -47,7 +47,9 @@ export async function chat(options: ChatOptions): Promise<LLMResponse> {
 
   if (options.tools && options.tools.length > 0) {
     body.tools = options.tools;
-    body.tool_choice = 'auto';
+    // 'required' forces a tool call on every turn — prevents the model from
+    // outputting plain text instead of a tool call (finish_reason: stop).
+    body.tool_choice = 'required';
   }
 
   let response: LLMResponse | undefined;
