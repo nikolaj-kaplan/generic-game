@@ -18,6 +18,7 @@ npm-debug.log*
 
 # Runtime data
 data/llm-logs/
+data/llm-logs-summary/
 data/sessions.json
 
 # OS
