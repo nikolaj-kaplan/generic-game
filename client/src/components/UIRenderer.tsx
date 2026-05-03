@@ -15,12 +15,15 @@ export default function UIRenderer({ components }: UIRendererProps) {
   const { send } = useGame();
   // Shared state for standalone (top-level) inputs
   const [topInputValues, setTopInputValues] = useState<Record<string, string>>({});
+  // Tracks which multiple_choice fieldIds have been submitted this screen
+  const [submittedChoices, setSubmittedChoices] = useState<Record<string, string>>({});
 
-  // Reset input values whenever the UI changes (new screen from LLM)
+  // Reset all interaction state whenever the UI changes (new screen from LLM)
   const prevComponents = useRef(components);
   useEffect(() => {
     if (prevComponents.current !== components) {
       setTopInputValues({});
+      setSubmittedChoices({});
       prevComponents.current = components;
     }
   }, [components]);
@@ -39,6 +42,12 @@ export default function UIRenderer({ components }: UIRendererProps) {
     }
   }
 
+  function handleChoiceSubmit(fieldId: string, option: string) {
+    if (submittedChoices[fieldId]) return;
+    setSubmittedChoices((prev) => ({ ...prev, [fieldId]: option }));
+    send({ type: 'form_submit', formId: fieldId, values: { [fieldId]: option } });
+  }
+
   return (
     <div className="ui-renderer">
       {components.map((comp, i) => (
@@ -48,6 +57,8 @@ export default function UIRenderer({ components }: UIRendererProps) {
           topInputValues={topInputValues}
           onTopInputChange={handleTopInputChange}
           onTopButtonClick={handleTopButtonClick}
+          submittedChoices={submittedChoices}
+          onChoiceSubmit={handleChoiceSubmit}
         />
       ))}
     </div>
@@ -59,9 +70,11 @@ interface NodeProps {
   topInputValues: Record<string, string>;
   onTopInputChange: (fieldId: string, value: string) => void;
   onTopButtonClick: (actionId: string) => void;
+  submittedChoices: Record<string, string>;
+  onChoiceSubmit: (fieldId: string, option: string) => void;
 }
 
-function UIComponentNode({ component: comp, topInputValues, onTopInputChange, onTopButtonClick }: NodeProps) {
+function UIComponentNode({ component: comp, topInputValues, onTopInputChange, onTopButtonClick, submittedChoices, onChoiceSubmit }: NodeProps) {
   switch (comp.type) {
     case 'text':
       return <TextComponent content={comp.content} style={comp.style} />;
@@ -107,7 +120,7 @@ function UIComponentNode({ component: comp, topInputValues, onTopInputChange, on
       );
 
     case 'multiple_choice':
-      return <MultipleChoice comp={comp} />;
+      return <MultipleChoice comp={comp} selected={submittedChoices[comp.fieldId] ?? null} onSelect={onChoiceSubmit} />;
 
     case 'countdown':
       return <Countdown comp={comp} />;
@@ -157,20 +170,15 @@ function TextComponent({
 // Multiple Choice
 // =============================================================================
 
-function MultipleChoice({ comp }: { comp: UIComponent & { type: 'multiple_choice' } }) {
-  const { send } = useGame();
-  const [selected, setSelected] = useState<string | null>(null);
-
-  function choose(option: string) {
-    if (selected !== null) return; // already answered
-    setSelected(option);
-    send({
-      type: 'form_submit',
-      formId: comp.fieldId,
-      values: { [comp.fieldId]: option },
-    });
-  }
-
+function MultipleChoice({
+  comp,
+  selected,
+  onSelect,
+}: {
+  comp: UIComponent & { type: 'multiple_choice' };
+  selected: string | null;
+  onSelect: (fieldId: string, option: string) => void;
+}) {
   return (
     <div className="mc">
       <p className="mc__question">{comp.question}</p>
@@ -180,7 +188,7 @@ function MultipleChoice({ comp }: { comp: UIComponent & { type: 'multiple_choice
           if (selected === opt) cls += ' mc__option--selected';
           else if (selected !== null) cls += ' mc__option--disabled';
           return (
-            <button key={opt} className={cls} onClick={() => choose(opt)} disabled={selected !== null}>
+            <button key={opt} className={cls} onClick={() => onSelect(comp.fieldId, opt)} disabled={selected !== null}>
               {opt}
             </button>
           );
