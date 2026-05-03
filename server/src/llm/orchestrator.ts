@@ -4,6 +4,7 @@ import * as connStore from '../connection-store';
 import { chat } from './client';
 import { definitionPrompt, playingPrompt } from './prompts';
 import { definitionTools, gameTools } from './tools';
+import { clearLogs } from './logger';
 import {
   Session,
   ChatMessage,
@@ -128,6 +129,18 @@ function tryParsePseudoToolCall(content: string): { name: string; args: unknown 
     if (typeof obj['name'] === 'string' && GAME_TOOL_NAMES.has(obj['name'])) {
       return { name: obj['name'], args: obj['arguments'] ?? {} };
     }
+    // Pattern 3: bare set_user_ui args — { "playerId": "...", "ui": [...] }
+    if (typeof obj['playerId'] === 'string' && Array.isArray(obj['ui'])) {
+      return { name: 'set_user_ui', args: obj };
+    }
+    // Pattern 4: bare set_state args — { "state": {...} }
+    if ('state' in obj && typeof obj['state'] === 'object' && obj['state'] !== null && !Array.isArray(obj['state'])) {
+      return { name: 'set_state', args: obj };
+    }
+    // Pattern 5: bare run_sequence args — { "steps": [...] }
+    if (Array.isArray(obj['steps'])) {
+      return { name: 'run_sequence', args: obj };
+    }
   } catch { /* not JSON */ }
   return null;
 }
@@ -139,7 +152,8 @@ function tryParsePseudoToolCall(content: string): { name: string; args: unknown 
 async function runGameLoop(session: Session): Promise<void> {
   let iterations = 0;
   const tag = `[game:${session.joinCode}]`;
-  let uiWasSet = false; // tracks whether set_user_ui fired at any point this run
+  let uiWasSet = false; // tracks whether set_user_ui fired at any point this run (used to suppress plain-text fallback)
+  let directUiSet = false; // tracks whether set_user_ui was called directly this iteration (used to break the loop)
   let consecutiveErrorIterations = 0; // how many back-to-back iterations had ≥1 tool error
 
   while (iterations < MAX_GAME_LOOP_ITERATIONS) {
@@ -166,14 +180,6 @@ async function runGameLoop(session: Session): Promise<void> {
       console.log(`${tag} LLM text: ${assistantMsg.content.slice(0, 300)}`);
     }
 
-    // Record assistant message (even if it only has tool_calls and no content)
-    const llmMsg: LLMMessage = {
-      role: 'assistant',
-      content: assistantMsg.content ?? null,
-      tool_calls: assistantMsg.tool_calls,
-    };
-    session.gameLlmMessages.push(llmMsg);
-
     if (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0) {
       // LLM responded with plain text instead of tool calls.
       if (assistantMsg.content && !uiWasSet) {
@@ -188,6 +194,16 @@ async function runGameLoop(session: Session): Promise<void> {
             function: { name: pseudoCall.name, arguments: JSON.stringify(pseudoCall.args) },
           };
           if (pseudoCall.name === 'set_user_ui') uiWasSet = true;
+          // Record as a proper tool call exchange so the history stays well-formed
+          session.gameLlmMessages.push({
+            role: 'assistant',
+            content: null,
+            tool_calls: [{
+              id: syntheticId,
+              type: 'function',
+              function: { name: pseudoCall.name, arguments: JSON.stringify(pseudoCall.args) },
+            }],
+          });
           const result = await executeGameTool(session, syntheticToolCall);
           session.gameLlmMessages.push({
             role: 'tool',
@@ -200,14 +216,15 @@ async function runGameLoop(session: Session): Promise<void> {
           continue;
         }
 
-        // Second try: if it's raw JSON (not a known tool call) — suppress it to
-        // avoid dumping a JSON blob on the player's screen.
+        // Second try: if it's raw JSON (not a known tool call) — suppress it entirely.
         const trimmed = assistantMsg.content.trimStart();
         if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
           console.warn(`${tag} LLM returned unrecognised JSON as plain text — suppressing`);
+          // Don't push to history — it's garbage that would poison future calls
         } else {
-          // Safe human-readable text — show it
-          console.warn(`${tag} LLM returned plain text (no tool calls) — injecting as UI text`);
+          // Looks like human-readable text — show it briefly in the UI but do NOT
+          // store it in history to avoid garbage accumulation across turns.
+          console.warn(`${tag} LLM returned plain text (no tool calls) — showing in UI, not storing in history`);
           const existingUi: UIComponent[] = session.playerUi['all'] ?? [];
           const baseUi = existingUi[0]?.type === 'text' && existingUi[0]?.style === 'success'
             ? existingUi.slice(1)
@@ -221,18 +238,31 @@ async function runGameLoop(session: Session): Promise<void> {
           store.saveSession(session);
         }
       } else if (assistantMsg.content) {
-        console.log(`${tag} LLM plain text after set_user_ui (ignored): ${assistantMsg.content.slice(0, 200)}`);
+        console.log(`${tag} LLM plain text after set_user_ui (ignored, not stored): ${assistantMsg.content.slice(0, 200)}`);
+        // Do not push to history — noisy filler text that pollutes the context
       }
       console.log(`${tag} No tool calls — exiting game loop`);
       break;
     }
 
+    // Record assistant message only when it actually has tool calls
+    const llmMsg: LLMMessage = {
+      role: 'assistant',
+      content: assistantMsg.content ?? null,
+      tool_calls: assistantMsg.tool_calls,
+    };
+    session.gameLlmMessages.push(llmMsg);
+
     console.log(`${tag} Tool calls: ${assistantMsg.tool_calls.map((t) => t.function.name).join(', ')}`);
 
     // Execute all tool calls and collect results
     let iterationHadError = false;
+    directUiSet = false; // reset each iteration
     for (const toolCall of assistantMsg.tool_calls) {
-      if (toolCall.function.name === 'set_user_ui') uiWasSet = true;
+      if (toolCall.function.name === 'set_user_ui') {
+        uiWasSet = true;
+        directUiSet = true;
+      }
       if (toolCall.function.name === 'run_sequence') {
         // run_sequence may include set_ui steps — mark uiWasSet so we don't
         // inject a duplicate plain-text fallback after the sequence
@@ -277,6 +307,15 @@ async function runGameLoop(session: Session): Promise<void> {
     // end_game tool sets status to 'finished'
     if (session.status === 'finished') {
       console.log(`${tag} Game finished — exiting loop`);
+      break;
+    }
+
+    // Stop after a direct set_user_ui call so the LLM cannot overwrite its own
+    // output in the next iteration. run_sequence is excluded: it manages its own
+    // timing internally and the LLM may legitimately need another iteration after
+    // the sequence completes (e.g. to compute score and then show the next screen).
+    if (directUiSet) {
+      console.log(`${tag} set_user_ui was called directly — exiting loop to await player input`);
       break;
     }
   }
@@ -407,6 +446,17 @@ async function executeGameTool(
         connStore.broadcast(session.id, { type: 'ui_update', ui });
       } else {
         connStore.sendToPlayer(session.id, playerId, { type: 'ui_update', ui });
+      }
+      const INTERACTIVE_TYPES = new Set(['button', 'input', 'multiple_choice', 'form']);
+      const hasInteraction = (ui as Array<{ type: string }>).some((c) => INTERACTIVE_TYPES.has(c.type));
+      if (!hasInteraction) {
+        return {
+          success: true,
+          warning:
+            'This UI has no interactive elements (no button, input, multiple_choice, or form). ' +
+            'The player will be unable to do anything unless a timer or run_sequence will advance the game. ' +
+            'If you are waiting for the player to respond, call set_user_ui again with at least one interactive component.',
+        };
       }
       return { success: true };
     }
@@ -556,7 +606,7 @@ async function executeGameTool(
       const finalUi = args.ui as UIComponent[] | undefined;
       console.log(`${tag} [tool] end_game message: ${args.message}`);
       console.log(`${tag} [tool] end_game results:`, JSON.stringify(args.results, null, 2));
-      connStore.broadcast(session.id, { type: 'status_change', status: 'finished' });
+      connStore.broadcast(session.id, { type: 'status_change', status: 'finished', message: args.message });
       if (finalUi) {
         connStore.broadcast(session.id, { type: 'ui_update', ui: finalUi });
       }
@@ -711,6 +761,7 @@ export async function startGame(sessionId: string): Promise<void> {
   const session = store.getSession(sessionId);
   if (!session || !session.agreedRules) return;
 
+  clearLogs();
   const startTag = `[start:${session.joinCode}]`;
   console.log(`${startTag} 🚀 Host confirmed rules — starting game`);
   session.status = 'playing';
