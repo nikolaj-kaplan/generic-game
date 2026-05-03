@@ -63,7 +63,7 @@ export type ServerMessage =
   | { type: 'chat_message'; message: ChatMessage }
   | { type: 'ui_update'; ui: UIComponent[] }
   | { type: 'state_update'; state: Record<string, unknown> }
-  | { type: 'status_change'; status: SessionStatus; agreedRules?: string }
+  | { type: 'status_change'; status: SessionStatus; agreedRules?: string; message?: string }
   | { type: 'timer_expired'; timerId: string }
   | { type: 'ai_thinking'; thinking: boolean }
   | { type: 'error'; message: string };

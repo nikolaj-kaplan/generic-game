@@ -29,6 +29,7 @@ interface GameState {
   currentUI: UIComponent[];
   gameState: Record<string, unknown>;
   agreedRules: string | null;
+  endGameMessage: string | null;
   isAiThinking: boolean;
   expiredTimers: Set<string>;
   errorMessage: string | null;
@@ -48,6 +49,7 @@ const initialState: GameState = {
   currentUI: [],
   gameState: {},
   agreedRules: null,
+  endGameMessage: null,
   isAiThinking: false,
   expiredTimers: new Set(),
   errorMessage: null,
@@ -215,6 +217,7 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
               ...prev,
               sessionStatus: msg.status,
               agreedRules: resetToLobby ? null : (msg.agreedRules !== undefined ? msg.agreedRules : prev.agreedRules),
+              endGameMessage: (resetToDefining || resetToLobby) ? null : (msg.message ?? prev.endGameMessage),
               gameState: (resetToDefining || resetToLobby) ? {} : prev.gameState,
               currentUI: (resetToDefining || resetToLobby) ? [] : prev.currentUI,
               chatMessages: resetToLobby ? [] : prev.chatMessages,

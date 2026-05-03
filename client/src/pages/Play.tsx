@@ -2,14 +2,29 @@ import { useState } from 'react';
 import { useGame, useCurrentPlayer } from '../context/GameContext';
 import UIRenderer from '../components/UIRenderer';
 
+const INTERACTIVE_UI_TYPES = new Set(['button', 'input', 'multiple_choice', 'form']);
+
 export default function Play() {
-  const { currentUI, isAiThinking, agreedRules, errorMessage, clearError, send, sessionStatus } =
+  const { currentUI, isAiThinking, agreedRules, errorMessage, clearError, send, sessionStatus, endGameMessage } =
     useGame();
   const currentPlayer = useCurrentPlayer();
   const [showRules, setShowRules] = useState(false);
   const [showTweak, setShowTweak] = useState(false);
   const [tweakInput, setTweakInput] = useState('');
   const isFinished = sessionStatus === 'finished';
+  const isStuck =
+    !isFinished &&
+    !isAiThinking &&
+    currentUI.length > 0 &&
+    !currentUI.some((c) => INTERACTIVE_UI_TYPES.has(c.type));
+
+  function handleStuckNudge() {
+    send({
+      type: 'game_tweak',
+      content:
+        "I don't have any buttons or inputs — I can't do anything. Please give me an action to perform.",
+    });
+  }
 
   function handlePlayAgain() {
     send({ type: 'reset_session' });
@@ -25,7 +40,7 @@ export default function Play() {
   }
 
   return (
-    <div className="page page--play">
+    <div className={`page page--play${isAiThinking ? ' page--thinking' : ''}`}>
       <header className="play-header">
         <span className="play-header__title">🎮 Game</span>
         <div className="play-header__actions">
@@ -57,17 +72,6 @@ export default function Play() {
           )}
         </div>
       </header>
-
-      {isAiThinking && (
-        <div className="thinking-banner">
-          <div className="thinking-banner__dots">
-            <span className="thinking-banner__dot" />
-            <span className="thinking-banner__dot" />
-            <span className="thinking-banner__dot" />
-          </div>
-          AI is thinking…
-        </div>
-      )}
 
       {showTweak && currentPlayer?.isHost && (
         <form className="tweak-bar" onSubmit={handleTweakSubmit}>
@@ -111,6 +115,14 @@ export default function Play() {
       )}
 
       <div className="play-content">
+        {isStuck && (
+          <div className="stuck-banner">
+            <span className="stuck-banner__msg">No action available.</span>
+            <button className="btn btn--secondary btn--sm" onClick={handleStuckNudge}>
+              Nudge AI →
+            </button>
+          </div>
+        )}
         {currentUI.length === 0 && !isAiThinking ? (
           <div className="play-waiting">
             <p>Waiting for the game to start…</p>
@@ -124,6 +136,9 @@ export default function Play() {
         <div className="game-over-overlay">
           <div className="game-over-panel">
             <div className="game-over-panel__title">🏁 Game over</div>
+            {endGameMessage && (
+              <p className="game-over-panel__message">{endGameMessage}</p>
+            )}
             {currentPlayer?.isHost ? (
               <>
                 <button className="btn btn--primary" onClick={handlePlayAgain}>
