@@ -1,63 +1,109 @@
+import path from 'path';
 import { v4 as uuid } from 'uuid';
+import { dataDir } from '../paths';
 import * as store from '../store';
 import * as connStore from '../connection-store';
-import { chat } from './client';
+import { chat, llmConfig, ChatOptions } from './client';
 import { definitionPrompt, playingPrompt } from './prompts';
-import { definitionTools, gameTools } from './tools';
-import { clearLogs } from './logger';
+import { definitionTools, definitionResponseSchema, gameToolsFor, nextTurnSchema } from './tools';
+import { newLogDirName, writeMetrics } from './logger';
+import {
+  ParsedTurn,
+  applyStateUpdate,
+  expectedResponders,
+  formatTurnEvent,
+  mergeConsecutiveUserMessages,
+  parseArguments,
+  parseNextTurn,
+  screenFor,
+  trimHistory,
+  tryParsePseudoNextTurn,
+  isInteractive,
+  extractJsonObject,
+  answerKeysFor,
+  sameAnswer,
+} from './turn';
+import { GamePlan, Progress, progressLine, recordAnswers } from './plan';
 import {
   Session,
   ChatMessage,
   LLMMessage,
   LLMToolCall,
   UIComponent,
+  PlayerResponse,
+  GameMetrics,
+  LLMResponse,
+  PendingTurn,
 } from '../types';
 
 // =============================================================================
 // Constants
 // =============================================================================
 
-const MAX_GAME_LOOP_ITERATIONS = 20;
-/** Keep only the last N messages in the playing-phase history to avoid huge context windows. */
-const MAX_GAME_LLM_MESSAGES = 40;
+/** Attempts per event before the turn is reported as stalled. */
+const MAX_ATTEMPTS = 3;
+/** Playing-phase history sent to the model (about 3 messages per turn). */
+const MAX_GAME_LLM_MESSAGES = Number(process.env.LLM_HISTORY_MESSAGES ?? 45);
 
 // =============================================================================
-// Active timers  (sessionId:timerId → timeout handle)
+// Per-session event queue
+//
+// Every event that touches a session (player input, timer, host action, AI
+// turn) runs one at a time, so two players clicking at once can never run two
+// game loops in parallel on the same history.
 // =============================================================================
 
-const activeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const queues = new Map<string, Promise<void>>();
 
-function timerKey(sessionId: string, timerId: string): string {
-  return `${sessionId}:${timerId}`;
+export function enqueue(sessionId: string, task: () => Promise<void>): Promise<void> {
+  const previous = queues.get(sessionId) ?? Promise.resolve();
+  const next = previous.then(task).catch((err) => console.error(`[orchestrator] task failed for ${sessionId}:`, err));
+  queues.set(sessionId, next);
+  void next.finally(() => {
+    if (queues.get(sessionId) === next) queues.delete(sessionId);
+  });
+  return next;
 }
 
-function clearTimer(sessionId: string, timerId: string): void {
-  const key = timerKey(sessionId, timerId);
-  const handle = activeTimers.get(key);
+/**
+ * Bumped on reset so an AI call that finishes after the host reset the game
+ * does not apply its (now stale) screens.
+ */
+const epochs = new Map<string, number>();
+const epochOf = (sessionId: string) => epochs.get(sessionId) ?? 0;
+
+// =============================================================================
+// Turn timers (one per session: the pending turn's timer)
+// =============================================================================
+
+const turnTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function clearTurnTimer(sessionId: string): void {
+  const handle = turnTimers.get(sessionId);
   if (handle !== undefined) {
     clearTimeout(handle);
-    activeTimers.delete(key);
+    turnTimers.delete(sessionId);
   }
 }
 
-function startTimer(sessionId: string, timerId: string, seconds: number): void {
-  clearTimer(sessionId, timerId);
+function startTurnTimer(sessionId: string, turn: number, seconds: number): void {
+  clearTurnTimer(sessionId);
   const handle = setTimeout(() => {
-    activeTimers.delete(timerKey(sessionId, timerId));
-    handleTimerExpired(sessionId, timerId, seconds).catch((err) =>
-      console.error('[orchestrator] timer error:', err),
-    );
+    turnTimers.delete(sessionId);
+    void enqueue(sessionId, () => onTimerExpired(sessionId, turn));
   }, seconds * 1000);
-  activeTimers.set(timerKey(sessionId, timerId), handle);
+  turnTimers.set(sessionId, handle);
 }
 
-/** Cancel every timer belonging to a session (e.g. on reset). */
+/** Stop timers and invalidate in-flight AI work (used by resets). */
 export function cancelAllTimers(sessionId: string): void {
-  for (const key of [...activeTimers.keys()]) {
-    if (key.startsWith(`${sessionId}:`)) {
-      clearTimeout(activeTimers.get(key)!);
-      activeTimers.delete(key);
-    }
+  clearTurnTimer(sessionId);
+  dropPrefetch(sessionId);
+  epochs.set(sessionId, epochOf(sessionId) + 1);
+  const session = store.getSession(sessionId);
+  if (session) {
+    session.pendingTurn = undefined;
+    session.stalled = undefined;
   }
 }
 
@@ -65,806 +111,854 @@ export function cancelAllTimers(sessionId: string): void {
 // Helpers
 // =============================================================================
 
-function toPublicSession(session: Session) {
+function addChatMessage(session: Session, role: 'ai' | 'system', content: string): void {
+  const msg: ChatMessage = { id: uuid(), role, content, timestamp: new Date().toISOString() };
+  session.chatHistory.push(msg);
+  connStore.broadcast(session.id, { type: 'chat_message', message: msg });
+}
+
+function newMetrics(): GameMetrics {
   return {
-    id: session.id,
-    joinCode: session.joinCode,
-    status: session.status,
-    players: session.players,
-    chatHistory: session.chatHistory,
-    agreedRules: session.agreedRules,
-    gameState: session.gameState,
-    createdAt: session.createdAt,
+    model: llmConfig().model,
+    startedAt: new Date().toISOString(),
+    llmCalls: 0,
+    llmMs: 0,
+    turns: 0,
+    invalidCalls: 0,
+    textReplies: 0,
+    stalls: 0,
+    httpErrors: 0,
+    promptTokensMax: 0,
+    finished: false,
   };
 }
 
-function addAiChatMessage(session: Session, content: string): void {
-  const msg: ChatMessage = {
-    id: uuid(),
-    role: 'ai',
-    content,
-    timestamp: new Date().toISOString(),
-  };
-  session.chatHistory.push(msg);
-  connStore.broadcast(session.id, { type: 'chat_message', message: msg });
+function metricsOf(session: Session): GameMetrics {
+  if (!session.metrics) session.metrics = newMetrics();
+  return session.metrics;
 }
 
-function addSystemChatMessage(session: Session, content: string): void {
-  const msg: ChatMessage = {
-    id: uuid(),
-    role: 'system',
-    content,
-    timestamp: new Date().toISOString(),
-  };
-  session.chatHistory.push(msg);
-  connStore.broadcast(session.id, { type: 'chat_message', message: msg });
+function broadcastTurnStatus(session: Session): void {
+  const pt = session.pendingTurn;
+  if (!pt || pt.waitFor !== 'all') {
+    connStore.broadcast(session.id, { type: 'turn_status', status: null });
+    return;
+  }
+  const nameOf = (id: string) => session.players.find((p) => p.id === id)?.name ?? id;
+  const answered = pt.responses.map((r) => nameOf(r.playerId));
+  const waitingFor = pt.expected.filter((id) => !pt.responses.some((r) => r.playerId === id)).map(nameOf);
+  connStore.broadcast(session.id, { type: 'turn_status', status: { turn: pt.turn, waitingFor, answered } });
+}
+
+/** Send every player their current screen (also used after reconnects). */
+function pushScreens(session: Session, turn: number | undefined): void {
+  for (const player of session.players) {
+    const ui = session.playerUi[player.id] ?? session.playerUi.all ?? [];
+    connStore.sendToPlayer(session.id, player.id, { type: 'ui_update', ui, turn });
+  }
+}
+
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+const AUTO_CONTINUE_EVENT = 'EVENT: That screen has been shown.';
+
+// Models pick the same "random" content every game (the Eiffel Tower, every
+// time). A few random words at game start nudge secret picks and questions
+// in a different direction each game.
+const INSPIRATION = [
+  'volcano', 'penguin', 'saxophone', 'Tokyo', 'chess', 'submarine', 'pizza', 'Amazon river', 'jazz', 'Mars',
+  'castle', 'octopus', 'Olympics', 'Egypt', 'chocolate', 'robot', 'Viking', 'rainforest', 'bicycle', 'opera',
+  'desert', 'lighthouse', 'tiger', 'Brazil', 'magician', 'glacier', 'dinosaur', 'Hollywood', 'tea', 'pirate',
+  'Antarctica', 'violin', 'football', 'Moon', 'samurai', 'circus', 'coral reef', 'Iceland', 'detective', 'kangaroo',
+  'medieval', 'skateboard', 'Shakespeare', 'Sahara', 'honey', 'astronaut', 'carnival', 'Norway', 'cheese', 'eagle',
+];
+
+function varietyHint(): string {
+  const picks = [...INSPIRATION].sort(() => Math.random() - 0.5).slice(0, 3);
+  return `secret answers, words and questions you invent this game must be connected to one of these themes: ${picks.join(', ')} ` +
+    '(not the most famous example you can think of). Do not mention the themes to the players.';
+}
+
+/** Lengths of list values, so the model does not have to count items itself. */
+function listLengths(state: Record<string, unknown>): string {
+  const parts = Object.entries(state)
+    .filter(([, v]) => Array.isArray(v))
+    .map(([k, v]) => `${k}=${(v as unknown[]).length}`);
+  return parts.length ? `\nLIST LENGTHS: ${parts.join(', ')}` : '';
+}
+
+/** One-line summary of a screen for the console, e.g. "Round 2" | multiple_choice(4) | scoreboard */
+function describeScreen(ui: UIComponent[]): string {
+  return ui
+    .map((c) => {
+      if (c.type === 'text') return JSON.stringify(c.content.slice(0, 60));
+      if (c.type === 'multiple_choice') {
+        const opts = c.playerOptions ? `<players: ${c.playerOptions}>` : c.options.join(' / ').slice(0, 80);
+        return `choice ${JSON.stringify(c.question.slice(0, 50))} [${opts}]`;
+      }
+      if (c.type === 'button') return `[${c.label}]`;
+      return c.type;
+    })
+    .join(' | ');
 }
 
 // =============================================================================
-// Pseudo-tool-call detection
+// Playing phase: one AI turn per event
 // =============================================================================
 
-const GAME_TOOL_NAMES = new Set([
-  'set_state_schema', 'get_state', 'set_state', 'set_user_ui',
-  'run_sequence', 'start_timer', 'update_rules', 'end_game',
-]);
+/** The full chat request for the next game turn (same shape for real calls and prefetches). */
+function gameRequest(session: Session, scratch: LLMMessage[]): ChatOptions {
+  const jsonMode = llmConfig().protocol === 'json';
+  return {
+    messages: buildGameMessages(session, scratch),
+    ...(jsonMode
+      ? { responseSchema: { name: 'next_turn', schema: nextTurnSchema(session.players, session.gameState.plan as GamePlan | undefined) } }
+      : { tools: gameToolsFor(session.players), toolChoice: 'required' as const }),
+    logDir: session.logDir,
+    phase: 'playing',
+  };
+}
+
+const requestKey = (r: ChatOptions) => JSON.stringify([r.messages, r.responseSchema, r.tools]);
+
+// =============================================================================
+// Prefetch: think ahead when the next event is certain
+//
+// When only one thing can happen next (one player with a single button, or a
+// screen that just waits for its timer), the next event is fully known. The
+// server asks the AI for the following screen while the player reads, and uses
+// the reply only if the real request turns out byte-for-byte identical.
+// =============================================================================
+
+interface Prefetch {
+  key: string;
+  promise: Promise<LLMResponse>;
+  controller: AbortController;
+}
+
+const prefetches = new Map<string, Prefetch>();
+const prefetchEnabled = () => process.env.LLM_PREFETCH !== 'false';
+
+function dropPrefetch(sessionId: string): void {
+  const p = prefetches.get(sessionId);
+  if (p) {
+    p.controller.abort();
+    prefetches.delete(sessionId);
+  }
+}
+
+function takePrefetch(sessionId: string, key: string, metrics: GameMetrics): Promise<LLMResponse> | undefined {
+  const p = prefetches.get(sessionId);
+  if (!p) return undefined;
+  prefetches.delete(sessionId);
+  if (p.key === key) {
+    metrics.prefetchHits = (metrics.prefetchHits ?? 0) + 1;
+    return p.promise;
+  }
+  metrics.prefetchMisses = (metrics.prefetchMisses ?? 0) + 1;
+  p.controller.abort();
+  return undefined;
+}
+
+/** The single response this turn can get, or null when there are several possible outcomes. */
+function onlyPossibleOutcome(session: Session, pending: PendingTurn): { reason: 'responses' | 'timeout'; responses: PlayerResponse[] } | null {
+  if (pending.expected.length === 0) return pending.timerSeconds ? { reason: 'timeout', responses: [] } : null;
+  if (pending.expected.length !== 1 || pending.waitFor !== 'any' || pending.timerSeconds) return null;
+  const playerId = pending.expected[0];
+  const player = session.players.find((p) => p.id === playerId);
+  const ui = session.playerUi[playerId] ?? [];
+  const interactive = ui.filter((c) => isInteractive([c]));
+  if (!player || interactive.length !== 1 || interactive[0].type !== 'button') return null;
+  return { reason: 'responses', responses: [{ playerId, playerName: player.name, kind: 'action', id: interactive[0].actionId }] };
+}
+
+/** Start preparing the next screen if the next event is certain. */
+function maybePrefetch(session: Session): void {
+  dropPrefetch(session.id);
+  const pending = session.pendingTurn;
+  if (!prefetchEnabled() || !pending || session.status !== 'playing') return;
+  const outcome = onlyPossibleOutcome(session, pending);
+  if (!outcome) return;
+
+  // Replay exactly what resolveTurn + runAiTurn will do, on a copy of the session.
+  const future = structuredClone(session) as Session;
+  const futurePending = { ...pending, responses: outcome.responses };
+  future.gameState = recordAnswers(future.gameState, futurePending, future.players);
+  future.gameLlmMessages.push({ role: 'user', content: formatTurnEvent(futurePending, outcome.reason, future.players) });
+  const request = gameRequest(future, []);
+  const controller = new AbortController();
+  const promise = chat({ ...request, signal: controller.signal });
+  promise.catch(() => undefined); // a failed or aborted prefetch just means no shortcut
+  prefetches.set(session.id, { key: requestKey(request), promise, controller });
+  console.log(`[game:${session.joinCode}] Thinking ahead: only one possible next step`);
+}
+
+/** Messages for one game-phase request. The current state rides on the latest event. */
+function buildGameMessages(session: Session, scratch: LLMMessage[]): LLMMessage[] {
+  const history = [...trimHistory(session.gameLlmMessages, MAX_GAME_LLM_MESSAGES)];
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].role === 'user') {
+      history[i] = {
+        ...history[i],
+        content:
+          `${history[i].content}\n\nCURRENT GAME STATE:\n${JSON.stringify(session.gameState)}${listLengths(session.gameState)}` +
+          progressLine(session.gameState.plan as GamePlan | undefined, session.gameState.progress as Progress | undefined),
+      };
+      break;
+    }
+  }
+  return mergeConsecutiveUserMessages([
+    { role: 'system', content: playingPrompt(session, llmConfig().protocol) },
+    ...history,
+    ...scratch,
+  ]);
+}
 
 /**
- * Some models return tool calls as plain JSON text instead of using the
- * tool-calling protocol. Detect the two common patterns:
- *   { "set_user_ui": { ...args } }          (single-key object)
- *   { "name": "set_user_ui", "arguments": { ...args } }
+ * Append an event to the game history and ask the model for the next turn.
+ * Retries invalid or text-only replies; only the successful exchange is kept
+ * in the history so failed attempts do not clutter later prompts.
  */
-function tryParsePseudoToolCall(content: string): { name: string; args: unknown } | null {
-  try {
-    const parsed = JSON.parse(content) as unknown;
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
-    const obj = parsed as Record<string, unknown>;
-    const keys = Object.keys(obj);
-    // Pattern 1: { "tool_name": { ...args } }
-    if (keys.length === 1 && GAME_TOOL_NAMES.has(keys[0])) {
-      return { name: keys[0], args: obj[keys[0]] };
-    }
-    // Pattern 2: { "name": "tool_name", "arguments": { ... } }
-    if (typeof obj['name'] === 'string' && GAME_TOOL_NAMES.has(obj['name'])) {
-      return { name: obj['name'], args: obj['arguments'] ?? {} };
-    }
-    // Pattern 3: bare set_user_ui args — { "playerId": "...", "ui": [...] }
-    if (typeof obj['playerId'] === 'string' && Array.isArray(obj['ui'])) {
-      return { name: 'set_user_ui', args: obj };
-    }
-    // Pattern 4: bare set_state args — { "state": {...} }
-    if ('state' in obj && typeof obj['state'] === 'object' && obj['state'] !== null && !Array.isArray(obj['state'])) {
-      return { name: 'set_state', args: obj };
-    }
-    // Pattern 5: bare run_sequence args — { "steps": [...] }
-    if (Array.isArray(obj['steps'])) {
-      return { name: 'run_sequence', args: obj };
-    }
-  } catch { /* not JSON */ }
-  return null;
-}
-
-// =============================================================================
-// Game loop (agentic tool-call processing)
-// =============================================================================
-
-async function runGameLoop(session: Session): Promise<void> {
-  let iterations = 0;
+async function runAiTurn(session: Session, eventText: string): Promise<void> {
   const tag = `[game:${session.joinCode}]`;
-  let uiWasSet = false; // tracks whether set_user_ui fired at any point this run (used to suppress plain-text fallback)
-  let directUiSet = false; // tracks whether set_user_ui was called directly this iteration (used to break the loop)
-  let consecutiveErrorIterations = 0; // how many back-to-back iterations had ≥1 tool error
+  const epoch = epochOf(session.id);
+  const metrics = metricsOf(session);
 
-  while (iterations < MAX_GAME_LOOP_ITERATIONS) {
-    iterations++;
-    console.log(`\n${tag} ── Game loop iteration ${iterations} ──────────────────`);
+  clearTurnTimer(session.id);
+  session.pendingTurn = undefined;
+  if (session.stalled) {
+    session.stalled = undefined;
+    connStore.broadcast(session.id, { type: 'game_error', message: null });
+  }
+  connStore.broadcast(session.id, { type: 'turn_status', status: null });
 
-    // Trim history to avoid bloating the context window
-    const recentMessages = session.gameLlmMessages.slice(-MAX_GAME_LLM_MESSAGES);
-    console.log(`${tag} Sending ${recentMessages.length} message(s) to LLM`);
+  session.gameLlmMessages.push({ role: 'user', content: eventText });
+  console.log(`${tag} ${eventText.split('\n')[0]}`);
+  connStore.broadcast(session.id, { type: 'ai_thinking', thinking: true });
 
-    const response = await chat({
-      messages: [
-        { role: 'system', content: playingPrompt(session) },
-        ...recentMessages,
-      ],
-      tools: gameTools,
-    });
+  const scratch: LLMMessage[] = [];
+  let lastProblem = 'unknown error';
+  const jsonMode = llmConfig().protocol === 'json';
+  // An auto-continue turn may not be followed by another one (no endless slide loops).
+  const parseOptions = {
+    allowAutoContinue: !eventText.startsWith(AUTO_CONTINUE_EVENT),
+    isFirstTurn: (session.turnCounter ?? 0) === 0,
+    previousWasSlide: session.lastTurnWasSlide === true,
+    plan: session.gameState.plan as GamePlan | undefined,
+    progress: session.gameState.progress as Progress | undefined,
+  };
 
-    const assistantMsg = response.choices[0].message;
-    const finishReason = response.choices[0].finish_reason;
-    console.log(`${tag} LLM finish_reason: ${finishReason}`);
+  try {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      let response;
+      const t0 = Date.now();
+      try {
+        const request = gameRequest(session, scratch);
+        const prefetched = attempt === 1 ? takePrefetch(session.id, requestKey(request), metrics) : undefined;
+        response = prefetched ? await prefetched : await chat(request);
+        if (prefetched) console.log(`${tag} Using the next screen prepared ahead of time`);
+      } catch (err) {
+        metrics.httpErrors++;
+        lastProblem = err instanceof Error ? err.message : String(err);
+        console.error(`${tag} LLM request failed (attempt ${attempt}): ${lastProblem}`);
+        if (lastProblem.includes('LLM_LOCAL_ONLY')) break;
+        await delay(1000 * attempt);
+        continue;
+      } finally {
+        metrics.llmCalls++;
+        metrics.llmMs += Date.now() - t0;
+      }
+      metrics.promptTokensMax = Math.max(metrics.promptTokensMax, response.usage?.prompt_tokens ?? 0);
 
-    if (assistantMsg.content) {
-      console.log(`${tag} LLM text: ${assistantMsg.content.slice(0, 300)}`);
-    }
+      // Reset or game over while the model was thinking: drop the result.
+      if (epoch !== epochOf(session.id) || session.status !== 'playing') {
+        console.log(`${tag} Session was reset during the AI call — discarding result`);
+        return;
+      }
 
-    if (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0) {
-      // LLM responded with plain text instead of tool calls.
-      if (assistantMsg.content && !uiWasSet) {
-        // First try: detect pseudo-tool-call JSON, e.g. { "set_user_ui": { ... } }
-        const pseudoCall = tryParsePseudoToolCall(assistantMsg.content);
-        if (pseudoCall) {
-          console.warn(`${tag} LLM returned pseudo-tool-call as plain text — executing ${pseudoCall.name}`);
-          const syntheticId = `synthetic-${Date.now()}`;
-          const syntheticToolCall: LLMToolCall = {
-            id: syntheticId,
-            type: 'function',
-            function: { name: pseudoCall.name, arguments: JSON.stringify(pseudoCall.args) },
-          };
-          if (pseudoCall.name === 'set_user_ui') uiWasSet = true;
-          // Record as a proper tool call exchange so the history stays well-formed
-          session.gameLlmMessages.push({
-            role: 'assistant',
-            content: null,
-            tool_calls: [{
-              id: syntheticId,
-              type: 'function',
-              function: { name: pseudoCall.name, arguments: JSON.stringify(pseudoCall.args) },
-            }],
-          });
-          const result = await executeGameTool(session, syntheticToolCall);
-          session.gameLlmMessages.push({
-            role: 'tool',
-            tool_call_id: syntheticId,
-            name: pseudoCall.name,
-            content: JSON.stringify(result),
-          });
-          store.saveSession(session);
-          // Don't break — continue the loop so the LLM can proceed
+      const message = response.choices[0].message;
+
+      if (response.choices[0].finish_reason === 'length') {
+        metrics.invalidCalls++;
+        lastProblem = 'reply was cut off at the token limit';
+        console.warn(`${tag} Attempt ${attempt}: ${lastProblem}`);
+        scratch.push(
+          { role: 'assistant', content: (message.content ?? '').slice(0, 500) + ' …(cut off)' },
+          { role: 'user', content: 'Your reply was cut off because it was too long. Reply again with a shorter turn: fewer and shorter texts, no extra whitespace.' },
+        );
+        continue;
+      }
+
+      if (jsonMode) {
+        const args = extractJsonObject(message.content ?? '');
+        if (!args) {
+          metrics.textReplies++;
+          lastProblem = `reply was not a JSON object: ${(message.content ?? '').slice(0, 200)}`;
+          console.warn(`${tag} Attempt ${attempt}: ${lastProblem}`);
+          scratch.push(
+            { role: 'assistant', content: message.content || '(empty reply)' },
+            { role: 'user', content: 'Reply with one JSON object for the next turn, and nothing else.' },
+          );
           continue;
         }
-
-        // Second try: if it's raw JSON (not a known tool call) — suppress it entirely.
-        const trimmed = assistantMsg.content.trimStart();
-        if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-          console.warn(`${tag} LLM returned unrecognised JSON as plain text — suppressing`);
-          // Don't push to history — it's garbage that would poison future calls
-        } else {
-          // Looks like human-readable text — show it briefly in the UI but do NOT
-          // store it in history to avoid garbage accumulation across turns.
-          console.warn(`${tag} LLM returned plain text (no tool calls) — showing in UI, not storing in history`);
-          const existingUi: UIComponent[] = session.playerUi['all'] ?? [];
-          const baseUi = existingUi[0]?.type === 'text' && existingUi[0]?.style === 'success'
-            ? existingUi.slice(1)
-            : existingUi;
-          const updatedUi: UIComponent[] = [
-            { type: 'text', content: assistantMsg.content, style: 'success' },
-            ...baseUi,
-          ];
-          session.playerUi['all'] = updatedUi;
-          connStore.broadcast(session.id, { type: 'ui_update', ui: updatedUi });
-          store.saveSession(session);
+        const parsedJson = parseNextTurn(args, session.players, parseOptions);
+        const assistantJson: LLMMessage = { role: 'assistant', content: JSON.stringify(args) };
+        if (!parsedJson.ok) {
+          metrics.invalidCalls++;
+          lastProblem = parsedJson.errors.join(' ');
+          console.warn(`${tag} Attempt ${attempt}: invalid turn — ${lastProblem}`);
+          scratch.push(assistantJson, {
+            role: 'user',
+            content: `That turn was rejected and nothing was shown. Problems:\n- ${parsedJson.errors.join('\n- ')}\nReply with the corrected JSON object.`,
+          });
+          continue;
         }
-      } else if (assistantMsg.content) {
-        console.log(`${tag} LLM plain text after set_user_ui (ignored, not stored): ${assistantMsg.content.slice(0, 200)}`);
-        // Do not push to history — noisy filler text that pollutes the context
+        session.gameLlmMessages.push(assistantJson, {
+          role: 'user',
+          content: `(server) Turn shown. ${describeWaiting(session, parsedJson.turn)}`,
+        });
+        await applyTurn(session, parsedJson.turn, epoch);
+        return;
       }
-      console.log(`${tag} No tool calls — exiting game loop`);
-      break;
-    }
 
-    // Record assistant message only when it actually has tool calls
-    const llmMsg: LLMMessage = {
-      role: 'assistant',
-      content: assistantMsg.content ?? null,
-      tool_calls: assistantMsg.tool_calls,
-    };
-    session.gameLlmMessages.push(llmMsg);
+      let call: LLMToolCall | undefined =
+        message.tool_calls?.find((c) => c.function.name === 'next_turn') ?? message.tool_calls?.[0];
 
-    console.log(`${tag} Tool calls: ${assistantMsg.tool_calls.map((t) => t.function.name).join(', ')}`);
+      if (!call) {
+        const pseudo = tryParsePseudoNextTurn(message.content);
+        if (pseudo) {
+          console.warn(`${tag} Model wrote next_turn as text — using it`);
+          call = { id: `text-${Date.now()}`, type: 'function', function: { name: 'next_turn', arguments: JSON.stringify(pseudo) } };
+        } else {
+          metrics.textReplies++;
+          lastProblem = `replied with text instead of a tool call: ${(message.content ?? '').slice(0, 200)}`;
+          console.warn(`${tag} Attempt ${attempt}: ${lastProblem}`);
+          scratch.push(
+            { role: 'assistant', content: message.content || '(empty reply)' },
+            { role: 'user', content: 'You must respond by calling the next_turn tool with the next screens. Do not write plain text.' },
+          );
+          continue;
+        }
+      }
 
-    // Execute all tool calls and collect results
-    let iterationHadError = false;
-    directUiSet = false; // reset each iteration
-    for (const toolCall of assistantMsg.tool_calls) {
-      if (toolCall.function.name === 'set_user_ui') {
-        uiWasSet = true;
-        directUiSet = true;
+      const assistantMsg: LLMMessage = { role: 'assistant', content: null, tool_calls: [call] };
+      const parsed =
+        call.function.name === 'next_turn'
+          ? parseNextTurn(parseArguments(call.function.arguments), session.players, parseOptions)
+          : { ok: false as const, errors: [`Unknown tool "${call.function.name}". The only tool is next_turn.`] };
+
+      if (!parsed.ok) {
+        metrics.invalidCalls++;
+        lastProblem = parsed.errors.join(' ');
+        console.warn(`${tag} Attempt ${attempt}: invalid next_turn — ${lastProblem}`);
+        scratch.push(assistantMsg, {
+          role: 'tool',
+          tool_call_id: call.id,
+          name: call.function.name,
+          content: JSON.stringify({ error: 'next_turn was rejected. Nothing was shown.', problems: parsed.errors, fix: 'Call next_turn again with every problem fixed.' }),
+        });
+        continue;
       }
-      if (toolCall.function.name === 'run_sequence') {
-        // run_sequence may include set_ui steps — mark uiWasSet so we don't
-        // inject a duplicate plain-text fallback after the sequence
-        try {
-          const seqArgs = JSON.parse(toolCall.function.arguments) as { steps?: Array<{ action: string }> };
-          if (seqArgs.steps?.some((s) => s.action === 'set_ui')) uiWasSet = true;
-        } catch { /* ignore parse errors — executeGameTool will handle it */ }
-      }
-      const result = await executeGameTool(session, toolCall);
-      const resultStr = JSON.stringify(result);
-      if (isToolError(result)) {
-        iterationHadError = true;
-        console.warn(`${tag} [tool] ${toolCall.function.name} returned error: ${(result as { error: string }).error}`);
-      }
-      session.gameLlmMessages.push({
+
+      const ignored = (message.tool_calls?.length ?? 1) - 1;
+      session.gameLlmMessages.push(assistantMsg, {
         role: 'tool',
-        tool_call_id: toolCall.id,
-        name: toolCall.function.name,
-        content: resultStr,
+        tool_call_id: call.id,
+        name: 'next_turn',
+        content: JSON.stringify(turnResultSummary(session, parsed.turn, ignored)),
       });
+      await applyTurn(session, parsed.turn, epoch);
+      return;
     }
 
-    if (iterationHadError) {
-      consecutiveErrorIterations++;
-      console.warn(`${tag} Consecutive error iterations: ${consecutiveErrorIterations}`);
-      if (consecutiveErrorIterations >= 2) {
-        const nudge = consecutiveErrorIterations >= 3
-          ? `SYSTEM: Your last ${consecutiveErrorIterations} tool calls have all returned errors. ` +
-            `Stop, re-read the RULES FOR TOOL USAGE in the system prompt, and fix your next call. ` +
-            `Do NOT output plain text — use a proper tool call.`
-          : `SYSTEM: The previous tool call returned an error (see result above). ` +
-            `Please read the error message carefully and retry with the correct arguments.`;
-        console.warn(`${tag} Injecting retry nudge (consecutive=${consecutiveErrorIterations})`);
-        session.gameLlmMessages.push({ role: 'user', content: nudge });
-      }
-    } else {
-      consecutiveErrorIterations = 0;
-    }
-
+    // Every attempt failed
+    metrics.stalls++;
+    session.stalled = lastProblem;
+    console.error(`${tag} Turn stalled: ${lastProblem}`);
+    connStore.broadcast(session.id, {
+      type: 'game_error',
+      message: `The AI could not produce the next screen (${lastProblem.slice(0, 200)}). Press Retry to try again.`,
+    });
+  } finally {
+    connStore.broadcast(session.id, { type: 'ai_thinking', thinking: false });
     store.saveSession(session);
+    writeMetrics(session.logDir, metrics);
+  }
+}
 
-    // end_game tool sets status to 'finished'
-    if (session.status === 'finished') {
-      console.log(`${tag} Game finished — exiting loop`);
-      break;
-    }
+/** Plain-language feedback on who can answer, so the model notices players it forgot. */
+function describeWaiting(session: Session, turn: ParsedTurn): string {
+  if (turn.gameOver) return 'The game is over.';
+  const expected = expectedResponders(turn.screens, session.players);
+  const nameOf = (id: string) => session.players.find((p) => p.id === id)?.name ?? id;
+  const idle = session.players.filter((p) => !expected.includes(p.id)).map((p) => p.name);
+  const who = expected.map(nameOf).join(', ') || 'nobody';
+  const waiting = turn.waitFor === 'all' ? `Waiting for all of: ${who}.` : `Waiting for the first response from: ${who}.`;
+  return idle.length ? `${waiting} Nothing to answer on the screens of: ${idle.join(', ')}.` : waiting;
+}
 
-    // Stop after a direct set_user_ui call so the LLM cannot overwrite its own
-    // output in the next iteration. run_sequence is excluded: it manages its own
-    // timing internally and the LLM may legitimately need another iteration after
-    // the sequence completes (e.g. to compute score and then show the next screen).
-    if (directUiSet) {
-      console.log(`${tag} set_user_ui was called directly — exiting loop to await player input`);
-      break;
+function turnResultSummary(session: Session, turn: ParsedTurn, ignoredCalls: number): Record<string, unknown> {
+  const expected = expectedResponders(turn.screens, session.players);
+  const names = expected.map((id) => session.players.find((p) => p.id === id)?.name ?? id);
+  const result: Record<string, unknown> = { ok: true };
+  if (turn.gameOver) result.game_over = true;
+  else if (turn.waitFor === 'all') result.waiting_for = `all of: ${names.join(', ') || 'nobody'}`;
+  else result.waiting_for = `first response from: ${names.join(', ') || 'nobody'}`;
+  if (turn.timerSeconds) result.timer_seconds = turn.timerSeconds;
+  if (ignoredCalls > 0) result.note = `Only one next_turn call per event is used; ${ignoredCalls} extra call(s) were ignored.`;
+  return result;
+}
+
+/** Apply a validated turn: state, intro slides, screens, timer, game over. */
+async function applyTurn(session: Session, turn: ParsedTurn, epoch: number): Promise<void> {
+  const tag = `[game:${session.joinCode}]`;
+  const metrics = metricsOf(session);
+  metrics.turns++;
+
+  if (turn.ruleChange) {
+    session.agreedRules = `${session.agreedRules ?? ''}\n\n[AMENDMENT] ${turn.ruleChange}`;
+    connStore.broadcast(session.id, { type: 'status_change', status: session.status, agreedRules: session.agreedRules });
+  }
+  session.gameState = applyStateUpdate(session.gameState, turn.stateUpdate, turn.stateAppend, turn.stateAdd);
+  if (turn.plan) session.gameState = { ...session.gameState, plan: turn.plan };
+  if (turn.progress) session.gameState = { ...session.gameState, progress: turn.progress };
+  session.lastTurnWasSlide = turn.isSlide;
+
+  if (turn.intro.length > 0) {
+    connStore.broadcast(session.id, { type: 'ai_thinking', thinking: false });
+    for (const slide of turn.intro) {
+      if (epoch !== epochOf(session.id) || session.status !== 'playing') return;
+      session.playerUi = { all: slide.screen };
+      connStore.broadcast(session.id, { type: 'ui_update', ui: slide.screen });
+      await delay(slide.seconds * 1000);
     }
+    if (epoch !== epochOf(session.id) || session.status !== 'playing') return;
   }
 
-  console.log(`${tag} ── Game loop done (${iterations} iteration(s)) ────────\n`);
+  const turnNo = (session.turnCounter ?? 0) + 1;
+  session.turnCounter = turnNo;
+  const endsAt = turn.timerSeconds ? Date.now() + turn.timerSeconds * 1000 : undefined;
+  const countdown: UIComponent | undefined = turn.timerSeconds
+    ? { type: 'countdown', timerId: `turn-${turnNo}`, seconds: turn.timerSeconds, endsAt }
+    : undefined;
+  const withTimer = (ui: UIComponent[]) => (countdown ? [countdown, ...ui] : ui);
+
+  session.playerUi = { all: withTimer(screenFor(turn.screens, '', session.players)) };
+  for (const player of session.players) {
+    session.playerUi[player.id] = withTimer(screenFor(turn.screens, player.id, session.players));
+  }
+  pushScreens(session, turnNo);
+  console.log(`${tag} Turn ${turnNo} shown (wait_for=${turn.waitFor}${turn.timerSeconds ? `, timer=${turn.timerSeconds}s` : ''}${turn.intro.length ? `, ${turn.intro.length} intro slides` : ''})`);
+  for (const [target, ui] of Object.entries(turn.screens)) {
+    const who = target === 'all' ? 'all' : session.players.find((p) => p.id === target)?.name ?? target;
+    console.log(`${tag}   ${who}: ${describeScreen(ui)}`);
+  }
+
+  if (turn.gameOver) {
+    session.status = 'finished';
+    session.pendingTurn = undefined;
+    metrics.finished = true;
+    connStore.broadcast(session.id, { type: 'status_change', status: 'finished', message: turn.gameOver.message });
+    console.log(`${tag} Game over: ${turn.gameOver.message}`);
+    return;
+  }
+
+  if (turn.autoContinue) {
+    console.log(`${tag} Screen has nothing to click — asking the AI for the next screen`);
+    await runAiTurn(session, `${AUTO_CONTINUE_EVENT} Now show the next screen (players need something to click or answer).`);
+    return;
+  }
+
+  const answerKeys: NonNullable<import('../types').PendingTurn['answerKeys']> = {};
+  for (const player of session.players) {
+    const keys = answerKeysFor(turn.screens, player.id);
+    if (Object.keys(keys).length) answerKeys[player.id] = keys;
+  }
+  session.pendingTurn = {
+    turn: turnNo,
+    waitFor: turn.waitFor,
+    expected: expectedResponders(turn.screens, session.players),
+    responses: [],
+    timerSeconds: turn.timerSeconds,
+    endsAt,
+    shownAt: Date.now(),
+    ...(Object.keys(answerKeys).length ? { answerKeys, checks: [] } : {}),
+  };
+  if (turn.timerSeconds) startTurnTimer(session.id, turnNo, turn.timerSeconds);
+  broadcastTurnStatus(session);
+  maybePrefetch(session);
+}
+
+/** End the pending turn and hand the collected responses to the model. */
+async function resolveTurn(session: Session, reason: 'responses' | 'timeout'): Promise<void> {
+  const pending = session.pendingTurn;
+  if (!pending) return;
+  clearTurnTimer(session.id);
+  session.pendingTurn = undefined;
+  session.gameState = recordAnswers(session.gameState, pending, session.players);
+  await runAiTurn(session, formatTurnEvent(pending, reason, session.players));
+}
+
+async function onTimerExpired(sessionId: string, turn: number): Promise<void> {
+  const session = store.getSession(sessionId);
+  if (!session || session.status !== 'playing' || session.pendingTurn?.turn !== turn) return;
+  connStore.broadcast(sessionId, { type: 'timer_expired', timerId: `turn-${turn}` });
+  await resolveTurn(session, 'timeout');
 }
 
 // =============================================================================
-// Tool executor
+// Public API — playing phase
 // =============================================================================
 
-/** Structured error that the LLM will see as a tool result. */
-function toolErr(message: string, fix?: string): { error: string; fix?: string } {
-  return fix ? { error: message, fix } : { error: message };
+export interface PlayerInput {
+  kind: 'action' | 'submit';
+  id: string;
+  values?: Record<string, string>;
+  /** Turn number of the screen the input came from. */
+  turn?: number;
 }
 
-function isToolError(result: unknown): boolean {
-  return typeof result === 'object' && result !== null && 'error' in result;
-}
+/** A player clicked a button, picked an option or submitted a form. */
+export function handlePlayerInput(sessionId: string, playerId: string, input: PlayerInput): Promise<void> {
+  return enqueue(sessionId, async () => {
+    const session = store.getSession(sessionId);
+    if (!session || session.status !== 'playing') return;
+    const player = session.players.find((p) => p.id === playerId);
+    if (!player) return;
+    const tag = `[game:${session.joinCode}]`;
+    const pending = session.pendingTurn;
 
-const VALID_UI_TYPES = new Set([
-  'text', 'input', 'button', 'multiple_choice', 'countdown',
-  'scoreboard', 'form', 'list', 'divider',
-]);
+    if (!pending) {
+      if (session.stalled) {
+        connStore.sendToPlayer(sessionId, playerId, { type: 'error', message: 'The AI is stuck. Press Retry to continue.' });
+      }
+      return;
+    }
+    if (input.turn !== undefined && input.turn !== pending.turn) {
+      console.log(`${tag} Ignoring input from ${player.name} for old turn ${input.turn} (current ${pending.turn})`);
+      return;
+    }
+    if (!pending.expected.includes(playerId)) {
+      connStore.sendToPlayer(sessionId, playerId, { type: 'error', message: "It's not your turn." });
+      return;
+    }
+    if (pending.responses.some((r) => r.playerId === playerId)) return;
+
+    const response: PlayerResponse = {
+      playerId,
+      playerName: player.name,
+      kind: input.kind,
+      id: input.id,
+      ...(input.values ? { values: input.values } : {}),
+      ...(pending.shownAt ? { elapsedMs: Date.now() - pending.shownAt } : {}),
+    };
+    pending.responses.push(response);
+    console.log(`${tag} ${player.name} → ${input.kind} "${input.id}" ${input.values ? JSON.stringify(input.values) : ''}`);
+
+    // Answer key: check right away, give points, and show the player the result instantly.
+    const feedback = checkAnswer(session, pending, player, input);
+
+    const allIn = pending.expected.every((id) => pending.responses.some((r) => r.playerId === id));
+    if ((pending.waitFor === 'any' || allIn) && feedback) {
+      // Show the verdict while the AI prepares the next screen.
+      const current = session.playerUi[playerId] ?? [];
+      const verdict = [...current.filter((c) => !isInteractive([c]) && c.type !== 'countdown'), ...feedback];
+      session.playerUi[playerId] = verdict;
+      connStore.sendToPlayer(sessionId, playerId, { type: 'ui_update', ui: verdict, turn: pending.turn });
+    }
+    if (pending.waitFor === 'any' || allIn) {
+      await resolveTurn(session, 'responses');
+      return;
+    }
+
+    // Waiting for others: lock this player's screen (their timer stops) and tell the others.
+    const current = session.playerUi[playerId] ?? [];
+    const locked: UIComponent[] = [
+      ...current.filter((c) => !isInteractive([c]) && c.type !== 'countdown'),
+      ...(feedback ?? []),
+      { type: 'text', content: '✓ Your answer is in. Waiting for the other players…', style: feedback ? 'muted' : 'success' },
+    ];
+    session.playerUi[playerId] = locked;
+    connStore.sendToPlayer(sessionId, playerId, { type: 'ui_update', ui: locked, turn: pending.turn });
+    for (const other of session.players) {
+      if (other.id !== playerId) connStore.sendToPlayer(sessionId, other.id, { type: 'toast', text: `${player.name} answered ✓` });
+    }
+    broadcastTurnStatus(session);
+    store.saveSession(session);
+  });
+}
 
 /**
- * Validate a ui[] array and return a toolErr if invalid, or null if valid.
- * @param ui      The candidate array (any unknown value).
- * @param context Human-readable prefix for error messages, e.g. "Step 2 ui".
+ * Check a submitted answer against the turn's answer key, add the points to
+ * state.scores and return the feedback components for the player (or null).
  */
-function validateUi(
-  ui: unknown,
-  context: string,
-): ReturnType<typeof toolErr> | null {
-  if (!Array.isArray(ui)) {
-    return toolErr(
-      `${context} must be an array of UI component objects.`,
-      'Example: [{ "type": "text", "content": "Hello", "style": "body" }]',
-    );
-  }
-  if (ui.length === 0) {
-    return toolErr(
-      `${context} array is empty. You must include at least one component.`,
-      `Valid types: ${[...VALID_UI_TYPES].join(', ')}.`,
-    );
-  }
-  const bad = (ui as Array<{ type?: unknown }>)
-    .filter((c) => !c.type || !VALID_UI_TYPES.has(c.type as string))
-    .map((c) => JSON.stringify(c.type));
-  if (bad.length > 0) {
-    return toolErr(
-      `${context} contains unknown component type(s): ${bad.join(', ')}.`,
-      `Valid types are: ${[...VALID_UI_TYPES].join(', ')}.`,
-    );
-  }
-  return null;
-}
-
-async function executeGameTool(
+function checkAnswer(
   session: Session,
-  toolCall: LLMToolCall,
-): Promise<unknown> {
-  let args: Record<string, unknown>;
-  try {
-    args = JSON.parse(toolCall.function.arguments) as Record<string, unknown>;
-  } catch {
-    return toolErr(
-      'Could not parse tool arguments as JSON.',
-      'Ensure the arguments are a valid JSON object. Do not include comments or trailing commas.',
+  pending: import('../types').PendingTurn,
+  player: { id: string; name: string },
+  input: PlayerInput,
+): UIComponent[] | null {
+  if (input.kind !== 'submit' || !input.values) return null;
+  const keys = pending.answerKeys?.[player.id];
+  if (!keys) return null;
+  const feedback: UIComponent[] = [];
+  for (const [fieldId, value] of Object.entries(input.values)) {
+    const key = keys[fieldId];
+    if (!key) continue;
+    const correct = key.correct.some((c) => sameAnswer(c, String(value)));
+    const points = correct ? key.points : key.penalty;
+    if (points) session.gameState = applyStateUpdate(session.gameState, undefined, undefined, { scores: { [player.name]: points } });
+    pending.checks = [
+      ...(pending.checks ?? []),
+      { playerName: player.name, fieldId, answer: String(value), correct, points, rightAnswer: key.correct.join(' / ') },
+    ];
+    const pts = points ? ` (${points > 0 ? '+' : ''}${points})` : '';
+    feedback.push(
+      correct
+        ? { type: 'text', content: `✓ Correct!${pts}`, style: 'success' }
+        : { type: 'text', content: `✗ The answer was ${key.correct.join(' / ')}${pts}`, style: 'error' },
     );
   }
-
-  const tag = `[game:${session.joinCode}]`;
-
-  switch (toolCall.function.name) {
-    case 'set_state_schema': {
-      if (typeof args.schema !== 'object' || args.schema === null || Array.isArray(args.schema)) {
-        return toolErr(
-          '"schema" must be a non-null JSON object.',
-          'Example: { "schema": { "type": "object", "properties": { "score": { "type": "number" } } } }',
-        );
-      }
-      session.stateSchema = args.schema as Record<string, unknown>;
-      console.log(`${tag} [tool] set_state_schema:`, JSON.stringify(args.schema, null, 2));
-      return { success: true };
-    }
-
-    case 'get_state': {
-      console.log(`${tag} [tool] get_state →`, JSON.stringify(session.gameState));
-      return session.gameState;
-    }
-
-    case 'set_state': {
-      if (typeof args.state !== 'object' || args.state === null || Array.isArray(args.state)) {
-        return toolErr(
-          '"state" must be a non-null JSON object.',
-          'Example: { "state": { "score": 0, "round": 1 } }',
-        );
-      }
-      const incoming = args.state as Record<string, unknown>;
-      if (args.merge === true) {
-        session.gameState = { ...session.gameState, ...incoming };
-      } else {
-        session.gameState = incoming;
-      }
-      console.log(`${tag} [tool] set_state (merge=${args.merge ?? false}):`, JSON.stringify(session.gameState, null, 2));
-      connStore.broadcast(session.id, { type: 'state_update', state: session.gameState });
-      return { success: true };
-    }
-
-    case 'set_user_ui': {
-      if (typeof args.playerId !== 'string' || args.playerId.trim() === '') {
-        return toolErr(
-          '"playerId" must be a non-empty string.',
-          'Use "all" to target all players, or a specific player ID. ' +
-          'For single-player games always use "all".',
-        );
-      }
-      const uiErr = validateUi(args.ui, '"ui"');
-      if (uiErr) return uiErr;
-      const playerId = args.playerId as string;
-      const ui = args.ui as UIComponent[];
-      session.playerUi[playerId] = ui;
-      const componentSummary = ui.map((c) => c.type).join(', ');
-      console.log(`${tag} [tool] set_user_ui → player:${playerId} | components: [${componentSummary}]`);
-      console.log(`${tag} [tool] set_user_ui payload:\n${JSON.stringify(ui, null, 2)}`);
-      if (playerId === 'all') {
-        connStore.broadcast(session.id, { type: 'ui_update', ui });
-      } else {
-        connStore.sendToPlayer(session.id, playerId, { type: 'ui_update', ui });
-      }
-      const INTERACTIVE_TYPES = new Set(['button', 'input', 'multiple_choice', 'form']);
-      const hasInteraction = (ui as Array<{ type: string }>).some((c) => INTERACTIVE_TYPES.has(c.type));
-      if (!hasInteraction) {
-        return {
-          success: true,
-          warning:
-            'This UI has no interactive elements (no button, input, multiple_choice, or form). ' +
-            'The player will be unable to do anything unless a timer or run_sequence will advance the game. ' +
-            'If you are waiting for the player to respond, call set_user_ui again with at least one interactive component.',
-        };
-      }
-      return { success: true };
-    }
-
-    case 'run_sequence': {
-      if (!Array.isArray(args.steps) || args.steps.length === 0) {
-        return toolErr(
-          '"steps" must be a non-empty array.',
-          'Each step needs an "action" field ("set_ui" or "set_state"). ' +
-          'set_ui steps need "playerId" and "ui". set_state steps need "state". ' +
-          'Add "delayBefore" (seconds) to control how long the previous step stays on screen.',
-        );
-      }
-      const rawSteps = args.steps as Array<Record<string, unknown>>;
-      for (let i = 0; i < rawSteps.length; i++) {
-        const s = rawSteps[i];
-        if (s['action'] !== 'set_ui' && s['action'] !== 'set_state') {
-          return toolErr(
-            `Step ${i} has invalid action "${String(s['action'])}".`,
-            'Each step\'s "action" must be either "set_ui" or "set_state".',
-          );
-        }
-        if (s['action'] === 'set_ui') {
-          const stepUiErr = validateUi(s['ui'], `Step ${i} "ui"`);
-          if (stepUiErr) return stepUiErr;
-        }
-        if (s['action'] === 'set_state' && (typeof s['state'] !== 'object' || s['state'] === null)) {
-          return toolErr(
-            `Step ${i}: set_state step is missing a "state" object.`,
-            'Add a "state" field with the state object to apply.',
-          );
-        }
-      }
-      const steps = rawSteps as Array<{
-        action: 'set_ui' | 'set_state';
-        delayBefore?: number;
-        playerId?: string;
-        ui?: UIComponent[];
-        state?: Record<string, unknown>;
-        merge?: boolean;
-      }>;
-      console.log(`${tag} [tool] run_sequence: ${steps.length} step(s)`);
-
-      // The LLM is NOT being called during the sequence — hide the thinking spinner.
-      connStore.broadcast(session.id, { type: 'ai_thinking', thinking: false });
-
-      for (let i = 0; i < steps.length; i++) {
-        // Check cancellation before each step
-        const current = store.getSession(session.id);
-        if (!current || current.status !== 'playing') {
-          console.log(`${tag} [tool] run_sequence aborted at step ${i} — session no longer playing`);
-          return { success: false, reason: 'session_ended', stepsCompleted: i };
-        }
-
-        const step = steps[i];
-        if (step.delayBefore && step.delayBefore > 0) {
-          await new Promise<void>((resolve) => setTimeout(resolve, step.delayBefore! * 1000));
-          // Re-check after delay
-          const currentAfterDelay = store.getSession(session.id);
-          if (!currentAfterDelay || currentAfterDelay.status !== 'playing') {
-            console.log(`${tag} [tool] run_sequence aborted after delay at step ${i}`);
-            return { success: false, reason: 'session_ended', stepsCompleted: i };
-          }
-        }
-
-        if (step.action === 'set_ui') {
-          const playerId = step.playerId ?? 'all';
-          const ui = step.ui ?? [];
-          session.playerUi[playerId] = ui;
-          const componentSummary = ui.map((c) => c.type).join(', ');
-          console.log(`${tag} [tool] run_sequence step ${i + 1}/${steps.length}: set_ui player:${playerId} [${componentSummary}]`);
-          if (playerId === 'all') {
-            connStore.broadcast(session.id, { type: 'ui_update', ui });
-          } else {
-            connStore.sendToPlayer(session.id, playerId, { type: 'ui_update', ui });
-          }
-        } else if (step.action === 'set_state') {
-          const incoming = step.state ?? {};
-          session.gameState = step.merge === true
-            ? { ...session.gameState, ...incoming }
-            : incoming;
-          console.log(`${tag} [tool] run_sequence step ${i + 1}/${steps.length}: set_state`, JSON.stringify(session.gameState));
-          connStore.broadcast(session.id, { type: 'state_update', state: session.gameState });
-        }
-
-        store.saveSession(session);
-      }
-
-      console.log(`${tag} [tool] run_sequence complete (${steps.length} steps)`);
-      // Sequence done — re-show the thinking spinner for the next LLM call.
-      connStore.broadcast(session.id, { type: 'ai_thinking', thinking: true });
-      return { success: true, stepsCompleted: steps.length };
-    }
-
-    case 'start_timer': {
-      if (typeof args.timerId !== 'string' || args.timerId.trim() === '') {
-        return toolErr(
-          '"timerId" must be a non-empty string.',
-          'Use a descriptive ID like "answer-timer" or "question-1". Must be unique per active timer.',
-        );
-      }
-      if (typeof args.seconds !== 'number' || args.seconds <= 0) {
-        return toolErr(
-          '"seconds" must be a positive number.',
-          'Example: { "timerId": "answer-timer", "seconds": 30 }',
-        );
-      }
-      const timerId = args.timerId as string;
-      const seconds = args.seconds as number;
-      console.log(`${tag} [tool] start_timer id:${timerId} seconds:${seconds}`);
-      startTimer(session.id, timerId, seconds);
-      return { success: true };
-    }
-
-    case 'update_rules': {
-      if (typeof args.amendment !== 'string' || args.amendment.trim() === '') {
-        return toolErr(
-          '"amendment" must be a non-empty string.',
-          'Describe the rule change concisely, e.g. "Scoring changed: +3 correct, -1 wrong".',
-        );
-      }
-      const amendment = args.amendment as string;
-      session.agreedRules = (session.agreedRules ?? '') + `\n\n[AMENDMENT] ${amendment}`;
-      console.log(`${tag} [tool] update_rules: ${amendment}`);
-      connStore.broadcast(session.id, {
-        type: 'status_change',
-        status: session.status,
-        agreedRules: session.agreedRules,
-      });
-      return { success: true };
-    }
-
-    case 'end_game': {
-      if (typeof args.message !== 'string' || args.message.trim() === '') {
-        return toolErr(
-          '"message" must be a non-empty string.',
-          'Provide a human-readable end-of-game message, e.g. "Alice wins with 15 points!".',
-        );
-      }
-      if (typeof args.results !== 'object' || args.results === null || Array.isArray(args.results)) {
-        return toolErr(
-          '"results" must be a non-null JSON object.',
-          'Example: { "results": { "winner": "Alice", "scores": { "Alice": 15, "Bob": 10 } } }',
-        );
-      }
-      session.status = 'finished';
-      const finalUi = args.ui as UIComponent[] | undefined;
-      console.log(`${tag} [tool] end_game message: ${args.message}`);
-      console.log(`${tag} [tool] end_game results:`, JSON.stringify(args.results, null, 2));
-      connStore.broadcast(session.id, { type: 'status_change', status: 'finished', message: args.message });
-      if (finalUi) {
-        connStore.broadcast(session.id, { type: 'ui_update', ui: finalUi });
-      }
-      return { success: true };
-    }
-
-    default:
-      console.warn(`${tag} [tool] Unknown tool called: ${toolCall.function.name}`);
-      return toolErr(
-        `Unknown tool "${toolCall.function.name}".`,
-        `Valid tools are: ${[...GAME_TOOL_NAMES].join(', ')}.`,
-      );
-  }
-}
-
-// =============================================================================
-// Timer expiry handler
-// =============================================================================
-
-async function handleTimerExpired(
-  sessionId: string,
-  timerId: string,
-  seconds: number,
-): Promise<void> {
-  const session = store.getSession(sessionId);
-  if (!session || session.status !== 'playing') return;
-
-  console.log(`[game:${session.joinCode}] ⏰ Timer expired: ${timerId}`);
-  connStore.broadcast(sessionId, { type: 'timer_expired', timerId });
-
-  session.gameLlmMessages.push({
-    role: 'user',
-    content: `Timer "${timerId}" has expired (${seconds}s limit). Process the timeout — award or deduct points as per the rules, then advance the game.`,
-  });
-
-  connStore.broadcast(sessionId, { type: 'ai_thinking', thinking: true });
-  try {
-    await runGameLoop(session);
-    store.saveSession(session);
-  } finally {
-    connStore.broadcast(sessionId, { type: 'ai_thinking', thinking: false });
-  }
-}
-
-// =============================================================================
-// Public API
-// =============================================================================
-
-/** Called when a player sends a chat message during the definition phase. */
-export async function handleDefinitionMessage(
-  sessionId: string,
-  playerName: string,
-  content: string,
-): Promise<void> {
-  const session = store.getSession(sessionId);
-  if (!session) return;
-
-  // Record player chat message
-  const playerMsg: ChatMessage = {
-    id: uuid(),
-    role: 'player',
-    playerName,
-    content,
-    timestamp: new Date().toISOString(),
-  };
-  session.chatHistory.push(playerMsg);
-  connStore.broadcast(sessionId, { type: 'chat_message', message: playerMsg });
-
-  // Add to LLM history
-  session.definitionLlmMessages.push({
-    role: 'user',
-    content: `[${playerName}]: ${content}`,
-  });
-
-  const defTag = `[define:${session.joinCode}]`;
-  console.log(`${defTag} Player message from ${playerName}: ${content}`);
-  connStore.broadcast(sessionId, { type: 'ai_thinking', thinking: true });
-
-  try {
-    const playerNames = session.players.map((p) => p.name);
-    console.log(`${defTag} Calling LLM (${session.definitionLlmMessages.length} messages in history)…`);
-    const response = await chat({
-      messages: [
-        { role: 'system', content: definitionPrompt(playerNames, session.agreedRules) },
-        ...session.definitionLlmMessages,
-      ],
-      tools: definitionTools,
-    });
-
-    const assistantMsg = response.choices[0].message;
-    const finishReason = response.choices[0].finish_reason;
-    console.log(`${defTag} LLM finish_reason: ${finishReason}`);
-
-    // Record assistant response
-    session.definitionLlmMessages.push({
-      role: 'assistant',
-      content: assistantMsg.content ?? null,
-      tool_calls: assistantMsg.tool_calls,
-    });
-
-    // Broadcast any plain-text response as an AI chat message
-    if (assistantMsg.content) {
-      console.log(`${defTag} AI text: ${assistantMsg.content.slice(0, 300)}`);
-      addAiChatMessage(session, assistantMsg.content);
-    }
-
-    // Handle tool calls
-    if (assistantMsg.tool_calls) {
-      for (const toolCall of assistantMsg.tool_calls) {
-        if (toolCall.function.name === 'propose_rules') {
-          let toolArgs: { summary: string };
-          try {
-            toolArgs = JSON.parse(toolCall.function.arguments) as { summary: string };
-          } catch {
-            continue;
-          }
-
-          session.agreedRules = toolArgs.summary;
-          console.log(`${defTag} ✅ Rules proposed:\n${toolArgs.summary}`);
-
-          // Add tool result to LLM history
-          session.definitionLlmMessages.push({
-            role: 'tool',
-            tool_call_id: toolCall.id,
-            name: 'propose_rules',
-            content: 'Rules proposed. Waiting for host confirmation.',
-          });
-
-          // Show rules in chat and prompt host to confirm
-          addSystemChatMessage(
-            session,
-            `📋 **Proposed rules:**\n\n${toolArgs.summary}\n\n*The host can now start the game.*`,
-          );
-
-          connStore.broadcast(sessionId, {
-            type: 'status_change',
-            status: 'defining',
-            agreedRules: toolArgs.summary,
-          });
-        }
-      }
-    }
-
-    store.saveSession(session);
-  } finally {
-    connStore.broadcast(sessionId, { type: 'ai_thinking', thinking: false });
-  }
+  return feedback.length ? feedback : null;
 }
 
 /** Called by the host to confirm rules and start the game. */
-export async function startGame(sessionId: string): Promise<void> {
-  const session = store.getSession(sessionId);
-  if (!session || !session.agreedRules) return;
+export function startGame(sessionId: string): Promise<void> {
+  return enqueue(sessionId, async () => {
+    const session = store.getSession(sessionId);
+    if (!session || !session.agreedRules) return;
 
-  clearLogs();
-  const startTag = `[start:${session.joinCode}]`;
-  console.log(`${startTag} 🚀 Host confirmed rules — starting game`);
-  session.status = 'playing';
-  session.gameLlmMessages = [];
+    clearTurnTimer(sessionId);
+    epochs.set(sessionId, epochOf(sessionId) + 1);
+    session.status = 'playing';
+    session.gameLlmMessages = [];
+    session.gameState = {};
+    session.playerUi = {};
+    session.turnCounter = 0;
+    session.pendingTurn = undefined;
+    session.stalled = undefined;
+    session.logDir = newLogDirName(session.joinCode, 'play');
+    session.metrics = newMetrics();
+    console.log(`[start:${session.joinCode}] Host confirmed rules — starting game (logs: ${path.join(dataDir(), 'llm-logs', session.logDir)})`);
 
-  connStore.broadcast(sessionId, {
-    type: 'status_change',
-    status: 'playing',
-    agreedRules: session.agreedRules,
+    connStore.broadcast(sessionId, { type: 'status_change', status: 'playing', agreedRules: session.agreedRules });
+
+    const playerList = session.players.map((p) => `${p.name} (id: ${p.id})`).join(', ');
+    await runAiTurn(
+      session,
+      `EVENT: The game is starting. Players: ${playerList}. Set up the initial game state and show the first screen.\n` +
+        `Variety: ${varietyHint()}`,
+    );
   });
+}
 
-  const playerList = session.players
-    .map((p) => `${p.name} (id: ${p.id})`)
-    .join(', ');
-  console.log(`${startTag} Players: ${playerList}`);
-
-  session.gameLlmMessages.push({
-    role: 'user',
-    content: `Game is starting. Players: ${playerList}. Initialize the game state, create the first screen, and start the game.`,
+/**
+ * Host sends an adjustment. Interrupts the pending turn. After game over it
+ * reopens the game, so the host can still ask for e.g. an extra final screen.
+ */
+export function handleGameTweak(sessionId: string, playerName: string, content: string): Promise<void> {
+  return enqueue(sessionId, async () => {
+    const session = store.getSession(sessionId);
+    if (!session || (session.status !== 'playing' && session.status !== 'finished')) return;
+    const reopened = session.status === 'finished';
+    if (reopened) {
+      session.status = 'playing';
+      if (session.metrics) session.metrics.finished = false;
+      connStore.broadcast(sessionId, { type: 'status_change', status: 'playing' });
+    }
+    const pending = session.pendingTurn;
+    if (pending) session.gameState = recordAnswers(session.gameState, pending, session.players);
+    const lines = [`EVENT: HOST ADJUSTMENT from ${playerName}: ${content}`];
+    if (reopened) {
+      lines.push('The game had already ended. Apply the adjustment (for example show the requested final screen), then set game_over to true again.');
+    }
+    if (pending) {
+      lines.push(
+        '',
+        `This interrupted turn ${pending.turn}. Show the current step again (adjusted) or move on.`,
+        formatTurnEvent(pending, 'interrupted', session.players).split('\n').slice(1).join('\n'),
+      );
+    }
+    await runAiTurn(session, lines.join('\n'));
   });
+}
 
-  connStore.broadcast(sessionId, { type: 'ai_thinking', thinking: true });
-  try {
-    await runGameLoop(session);
-    store.saveSession(session);
-  } finally {
-    connStore.broadcast(sessionId, { type: 'ai_thinking', thinking: false });
+/** Ask the AI again after a stall (or when players are stuck on a screen). */
+export function retryTurn(sessionId: string, requestedBy: string): Promise<void> {
+  return enqueue(sessionId, async () => {
+    const session = store.getSession(sessionId);
+    if (!session || session.status !== 'playing') return;
+    const pending = session.pendingTurn;
+    if (pending) session.gameState = recordAnswers(session.gameState, pending, session.players);
+    const lines = [`EVENT: ${requestedBy} asked you to continue the game. Show the next screen now.`];
+    if (pending) {
+      lines.push(formatTurnEvent(pending, 'interrupted', session.players).split('\n').slice(1).join('\n'));
+    }
+    await runAiTurn(session, lines.join('\n'));
+  });
+}
+
+/** True while an event (usually an AI turn) is being processed for the session. */
+export function isBusy(sessionId: string): boolean {
+  return queues.has(sessionId);
+}
+
+/**
+ * After a server restart, games that were waiting for the AI have no pending
+ * turn and nobody would ever answer. Mark them stalled so players get Retry.
+ */
+export function recoverInterruptedGames(sessions: Session[]): void {
+  for (const session of sessions) {
+    if (session.status === 'playing' && !session.pendingTurn && !session.stalled) {
+      session.stalled = 'interrupted by a server restart';
+      store.saveSession(session);
+      console.log(`[game:${session.joinCode}] Was interrupted by a server restart — players can press Retry`);
+    }
   }
 }
 
-/** Called when a player submits a form during the playing phase. */
-export async function handleFormSubmit(
-  sessionId: string,
-  playerId: string,
-  playerName: string,
-  formId: string,
-  values: Record<string, string>,
-): Promise<void> {
-  const session = store.getSession(sessionId);
-  if (!session || session.status !== 'playing') return;
-
-  console.log(`[game:${session.joinCode}] 📝 Form submit — player:${playerName} form:${formId} values:${JSON.stringify(values)}`);
-  session.gameLlmMessages.push({
-    role: 'user',
-    content: `Player ${playerName} (id: ${playerId}) submitted form "${formId}" with values: ${JSON.stringify(values)}`,
-  });
-
-  connStore.broadcast(sessionId, { type: 'ai_thinking', thinking: true });
-  try {
-    await runGameLoop(session);
-    store.saveSession(session);
-  } finally {
-    connStore.broadcast(sessionId, { type: 'ai_thinking', thinking: false });
+/** Re-send the current screen and status to one reconnecting player. */
+export function resendState(session: Session, playerId: string): void {
+  connStore.sendToPlayer(session.id, playerId, { type: 'ai_thinking', thinking: isBusy(session.id) });
+  const ui = session.playerUi[playerId] ?? session.playerUi.all;
+  if (ui) connStore.sendToPlayer(session.id, playerId, { type: 'ui_update', ui, turn: session.pendingTurn?.turn });
+  if (session.stalled) {
+    connStore.sendToPlayer(session.id, playerId, { type: 'game_error', message: `The AI could not produce the next screen. Press Retry to try again.` });
   }
+  broadcastTurnStatus(session);
 }
 
-/** Called when a player clicks an action button during the playing phase. */
-export async function handleAction(
-  sessionId: string,
-  playerId: string,
-  playerName: string,
-  actionId: string,
-): Promise<void> {
-  const session = store.getSession(sessionId);
-  if (!session || session.status !== 'playing') return;
+// =============================================================================
+// Public API — definition phase
+// =============================================================================
 
-  console.log(`[game:${session.joinCode}] 🖱️  Action — player:${playerName} actionId:${actionId}`);
-  session.gameLlmMessages.push({
-    role: 'user',
-    content: `Player ${playerName} (id: ${playerId}) clicked action "${actionId}".`,
-  });
-
-  connStore.broadcast(sessionId, { type: 'ai_thinking', thinking: true });
-  try {
-    await runGameLoop(session);
-    store.saveSession(session);
-  } finally {
-    connStore.broadcast(sessionId, { type: 'ai_thinking', thinking: false });
-  }
+function toPlayerRange(min: unknown, max: unknown): { min: number; max: number } | undefined {
+  const lo = Math.round(Number(min));
+  const hi = Math.round(Number(max));
+  if (!Number.isFinite(lo) || lo < 1) return undefined;
+  return { min: lo, max: Number.isFinite(hi) && hi >= lo ? hi : Math.max(lo, 20) };
 }
 
-/** Called when the host sends a mid-game tweak instruction. */
-export async function handleGameTweak(
-  sessionId: string,
-  playerName: string,
-  content: string,
-): Promise<void> {
-  const session = store.getSession(sessionId);
-  if (!session || session.status !== 'playing') return;
-
-  console.log(`[game:${session.joinCode}] 🎛️  Host tweak from ${playerName}: ${content}`);
-  session.gameLlmMessages.push({
-    role: 'user',
-    content: `[HOST ADJUSTMENT from ${playerName}]: ${content}`,
-  });
-
-  connStore.broadcast(sessionId, { type: 'ai_thinking', thinking: true });
-  try {
-    await runGameLoop(session);
-    store.saveSession(session);
-  } finally {
-    connStore.broadcast(sessionId, { type: 'ai_thinking', thinking: false });
-  }
+function rangeText(range: { min: number; max: number } | undefined): string {
+  if (!range) return '';
+  return range.min === range.max ? `${range.min} player${range.min === 1 ? '' : 's'}` : `${range.min}–${range.max} players`;
 }
 
-export { toPublicSession };
+/** Make rules the agreed rules (proposed by the AI or loaded from a saved game). */
+export function applyRules(session: Session, rules: string, range: { min: number; max: number } | undefined, source: 'ai' | 'saved'): void {
+  session.agreedRules = rules;
+  session.playerRange = range;
+  const intro = source === 'saved' ? '📂 **Saved rules loaded:**' : '📋 **Proposed rules:**';
+  const needs = range ? `\n\n*Needs ${rangeText(range)}.*` : '';
+  console.log(`[define:${session.joinCode}] ✅ Rules ${source === 'saved' ? 'loaded' : 'proposed'}${range ? ` (${rangeText(range)})` : ''}`);
+  addChatMessage(session, 'system', `${intro}\n\n${rules}${needs}\n\n*The host can start the game, or keep chatting to change the rules.*`);
+  connStore.broadcast(session.id, { type: 'status_change', status: 'defining', agreedRules: rules, playerRange: range });
+}
+
+/** json protocol: the reply is {"message", "proposed_rules", "min_players", "max_players"}. */
+function handleJsonDefinitionReply(session: Session, content: string | null): void {
+  const reply = extractJsonObject(content ?? '');
+  const message = typeof reply?.message === 'string' ? reply.message.trim() : '';
+  const rules = typeof reply?.proposed_rules === 'string' ? reply.proposed_rules.trim() : '';
+  session.definitionLlmMessages.push({ role: 'assistant', content: content ?? '' });
+  if (message) addChatMessage(session, 'ai', message);
+  if (rules) applyRules(session, rules, toPlayerRange(reply?.min_players, reply?.max_players), 'ai');
+  if (!message && !rules) addChatMessage(session, 'system', 'The AI gave an empty reply. Try sending your message again.');
+}
+
+/** Host loads saved rules: no AI call; the AI learns about them on the next chat message. */
+export function loadSavedRules(sessionId: string, playerName: string, rules: string, range?: { min: number; max: number }): Promise<void> {
+  return enqueue(sessionId, async () => {
+    const session = store.getSession(sessionId);
+    if (!session || session.status !== 'defining') return;
+    session.definitionLlmMessages.push({ role: 'user', content: `[${playerName} loaded these saved rules]:\n${rules}` });
+    session.definitionLlmMessages.push({ role: 'assistant', content: JSON.stringify({ message: 'Saved rules loaded.', proposed_rules: '', min_players: 0, max_players: 0 }) });
+    applyRules(session, rules, range ? toPlayerRange(range.min, range.max) : undefined, 'saved');
+    store.saveSession(session);
+  });
+}
+
+/** Called when a player sends a chat message during the definition phase. */
+export function handleDefinitionMessage(sessionId: string, playerName: string, content: string): Promise<void> {
+  return enqueue(sessionId, async () => {
+    const session = store.getSession(sessionId);
+    if (!session || session.status !== 'defining') return;
+    const defTag = `[define:${session.joinCode}]`;
+
+    const playerMsg: ChatMessage = {
+      id: uuid(),
+      role: 'player',
+      playerName,
+      content,
+      timestamp: new Date().toISOString(),
+    };
+    session.chatHistory.push(playerMsg);
+    connStore.broadcast(sessionId, { type: 'chat_message', message: playerMsg });
+    session.definitionLlmMessages.push({ role: 'user', content: `[${playerName}]: ${content}` });
+    if (!session.logDir?.endsWith('_define')) session.logDir = newLogDirName(session.joinCode, 'define');
+
+    console.log(`${defTag} ${playerName}: ${content.slice(0, 120)}`);
+    connStore.broadcast(sessionId, { type: 'ai_thinking', thinking: true });
+
+    try {
+      const jsonMode = llmConfig().protocol === 'json';
+      const response = await chat({
+        messages: mergeConsecutiveUserMessages([
+          { role: 'system', content: definitionPrompt(session, llmConfig().protocol) },
+          ...session.definitionLlmMessages,
+        ]),
+        ...(jsonMode
+          ? { responseSchema: { name: 'definition_reply', schema: definitionResponseSchema } }
+          : { tools: definitionTools, toolChoice: 'auto' as const }),
+        logDir: session.logDir,
+        phase: 'definition',
+      });
+
+      if (jsonMode) {
+        handleJsonDefinitionReply(session, response.choices[0].message.content);
+        return;
+      }
+
+      const assistantMsg = response.choices[0].message;
+      const proposal = assistantMsg.tool_calls?.find((c) => c.function.name === 'propose_rules');
+      session.definitionLlmMessages.push({
+        role: 'assistant',
+        content: assistantMsg.content || null,
+        ...(proposal ? { tool_calls: [proposal] } : {}),
+      });
+
+      if (assistantMsg.content) addChatMessage(session, 'ai', assistantMsg.content);
+
+      if (proposal) {
+        const args = parseArguments(proposal.function.arguments);
+        const summary = typeof args?.summary === 'string' ? args.summary.trim() : '';
+        if (summary) {
+          session.definitionLlmMessages.push({
+            role: 'tool',
+            tool_call_id: proposal.id,
+            name: 'propose_rules',
+            content: 'Rules shown to the players. Waiting for the host to start the game.',
+          });
+          applyRules(session, summary, toPlayerRange(args?.min_players, args?.max_players), 'ai');
+        } else {
+          session.definitionLlmMessages.push({
+            role: 'tool',
+            tool_call_id: proposal.id,
+            name: 'propose_rules',
+            content: 'Error: "summary" was missing or empty. Nothing was shown.',
+          });
+          addChatMessage(session, 'system', 'The AI tried to propose rules but the proposal was empty. Ask it to propose the rules again.');
+        }
+      } else if (!assistantMsg.content) {
+        addChatMessage(session, 'system', 'The AI gave an empty reply. Try sending your message again.');
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`${defTag} LLM call failed: ${message}`);
+      addChatMessage(session, 'system', `⚠️ The AI could not be reached: ${message.slice(0, 200)}`);
+    } finally {
+      store.saveSession(session);
+      connStore.broadcast(sessionId, { type: 'ai_thinking', thinking: false });
+    }
+  });
+}

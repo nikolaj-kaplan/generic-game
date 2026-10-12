@@ -7,7 +7,13 @@
     "build": "tsc",
     "start": "tsc && node dist/server/src/index.js",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "playtest": "tsx scripts/playtest.ts",
+    "transcript": "tsx scripts/transcript.ts",
+    "bridge": "tsx scripts/llm-bridge.ts",
+    "bridge:show": "tsx scripts/bridge-show.ts",
+    "codegen:eval": "tsx scripts/codegen-eval.ts",
+    "play:program": "tsx scripts/play-program.ts"
   },
   "dependencies": {
     "@fastify/cors": "^9.0.1",
@@ -15,6 +21,7 @@
     "@fastify/websocket": "^10.0.1",
     "dotenv": "^16.4.5",
     "fastify": "^4.27.0",
+    "quickjs-emscripten": "^0.32.0",
     "uuid": "^9.0.1"
   },
   "devDependencies": {

@@ -26,3 +26,15 @@ data/sessions.json
 
 # Editor
 .vscode/
+
+# Automated playtest runs
+data/playtests/
+data/e2e/
+data/playtest-latest.log
+.playwright-mcp/
+data/llm-bridge/
+
+# Local model routing (see models.example.json)
+models.json
+data/codegen-evals/
+data/program-plays/

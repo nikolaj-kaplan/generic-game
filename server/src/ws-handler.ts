@@ -3,6 +3,7 @@ import type { WebSocket } from '@fastify/websocket';
 import * as store from './store';
 import * as connStore from './connection-store';
 import * as orchestrator from './llm/orchestrator';
+import * as engineHost from './engine/host';
 import { ClientMessage, Session, Player, SessionPublic } from './types';
 
 // =============================================================================
@@ -50,6 +51,17 @@ function createFreshSession(hostName: string): { session: Session; player: Playe
   return { session, player };
 }
 
+/** Games run by a generated program (the default) or by the AI turn by turn (GAME_ENGINE=legacy). */
+function programGame(session: Session): boolean {
+  if (session.status === 'playing' || session.status === 'finished') return !!session.program;
+  return engineHost.engineMode() === 'program';
+}
+
+function resendState(session: Session, playerId: string): void {
+  if (programGame(session)) engineHost.resendState(session, playerId);
+  else orchestrator.resendState(session, playerId);
+}
+
 function toPublicSession(session: Session): SessionPublic {
   return {
     id: session.id,
@@ -58,7 +70,7 @@ function toPublicSession(session: Session): SessionPublic {
     players: session.players,
     chatHistory: session.chatHistory,
     agreedRules: session.agreedRules,
-    gameState: session.gameState,
+    playerRange: session.playerRange,
     createdAt: session.createdAt,
   };
 }
@@ -148,25 +160,25 @@ async function handleMessage(
       return;
     }
 
-    if (session.status === 'finished') {
-      send({ type: 'error', message: 'This session has already ended.' });
-      return;
-    }
-
-    // Reconnect by playerId if provided
+    // Reconnect by playerId if provided (also after the game ended, so the
+    // host can still press "Play again" after a reload or a network blip)
     if (msg.playerId) {
       const existing = session.players.find((p) => p.id === msg.playerId);
       if (existing) {
         connStore.associateConnection(connectionId, session.id, existing.id);
-        const ui = session.playerUi[existing.id] ?? session.playerUi['all'];
         send({
           type: 'session_joined',
           session: toPublicSession(session),
           playerId: existing.id,
         });
-        if (ui) send({ type: 'ui_update', ui });
+        resendState(session, existing.id);
         return;
       }
+    }
+
+    if (session.status === 'finished') {
+      send({ type: 'error', message: 'This session has already ended.' });
+      return;
     }
 
     if (!name) {
@@ -187,6 +199,19 @@ async function handleMessage(
     connStore.associateConnection(connectionId, session.id, newPlayer.id);
     send({ type: 'session_joined', session: toPublicSession(session), playerId: newPlayer.id });
     connStore.broadcast(session.id, { type: 'player_joined', player: newPlayer });
+    if (session.status === 'defining') {
+      const joinedMsg = {
+        id: uuid(),
+        role: 'system' as const,
+        content: `👋 ${newPlayer.name} joined`,
+        timestamp: new Date().toISOString(),
+      };
+      session.chatHistory.push(joinedMsg);
+      store.saveSession(session);
+      connStore.broadcast(session.id, { type: 'chat_message', message: joinedMsg });
+    }
+    // Joining mid-game: show the shared screen until the AI includes the new player.
+    if (session.status === 'playing') resendState(session, newPlayer.id);
     console.log(`[ws] ${name} joined session ${session.joinCode}`);
     return;
   }
@@ -206,6 +231,24 @@ async function handleMessage(
   const player = session.players.find((p) => p.id === playerId);
   if (!player) {
     send({ type: 'error', message: 'Player not found in session.' });
+    return;
+  }
+
+  // ── leave_session ───────────────────────────────────────────────────────────
+  if (msg.type === 'leave_session') {
+    session.players = session.players.filter((p) => p.id !== playerId);
+    connStore.unregisterConnection(connectionId);
+    connStore.registerConnection(connectionId, socket);
+    if (session.players.length > 0 && !session.players.some((p) => p.isHost)) {
+      session.players[0] = { ...session.players[0], isHost: true };
+    }
+    if (session.players.length === 0) {
+      orchestrator.cancelAllTimers(sessionId);
+      engineHost.cancel(sessionId);
+    }
+    store.saveSession(session);
+    connStore.broadcast(sessionId, { type: 'players_update', players: session.players });
+    console.log(`[ws] ${player.name} left session ${session.joinCode}`);
     return;
   }
 
@@ -262,8 +305,50 @@ async function handleMessage(
       send({ type: 'error', message: 'No rules have been proposed yet.' });
       return;
     }
+    const range = session.playerRange;
+    const count = session.players.length;
+    if (range && (count < range.min || count > range.max)) {
+      send({
+        type: 'error',
+        message: count < range.min
+          ? `This game needs at least ${range.min} players (${count} joined). Invite more players first.`
+          : `This game allows at most ${range.max} players (${count} joined).`,
+      });
+      return;
+    }
 
-    await orchestrator.startGame(sessionId);
+    if (programGame(session)) await engineHost.confirmRules(sessionId);
+    else await orchestrator.startGame(sessionId);
+    return;
+  }
+
+  // ── load_rules ──────────────────────────────────────────────────────────────
+  if (msg.type === 'load_rules') {
+    if (!player.isHost) {
+      send({ type: 'error', message: 'Only the host can load saved rules.' });
+      return;
+    }
+    const rules = msg.rules?.trim();
+    if (!rules) return;
+    if (session.status === 'lobby') {
+      session.status = 'defining';
+      store.saveSession(session);
+      connStore.broadcast(sessionId, { type: 'status_change', status: 'defining' });
+    }
+    if (session.status !== 'defining') {
+      send({ type: 'error', message: 'Saved rules can only be loaded before the game starts.' });
+      return;
+    }
+    await orchestrator.loadSavedRules(sessionId, player.name, rules, msg.playerRange);
+    if (msg.program && msg.program.rules === rules && programGame(session)) {
+      await orchestrator.enqueue(sessionId, async () => {
+        const s = store.getSession(sessionId);
+        if (s?.agreedRules === rules && (await engineHost.adoptSavedProgram(s, msg.program!.code, rules))) {
+          console.log(`[define:${s.joinCode}] Saved program loaded with the rules`);
+          store.saveSession(s);
+        }
+      });
+    }
     return;
   }
 
@@ -273,13 +358,16 @@ async function handleMessage(
       send({ type: 'error', message: 'Game is not in progress.' });
       return;
     }
-    await orchestrator.handleFormSubmit(
-      sessionId,
-      playerId,
-      player.name,
-      msg.formId,
-      msg.values,
-    );
+    if (programGame(session)) {
+      await engineHost.handleInput(sessionId, playerId, { kind: 'submit', id: String(msg.formId ?? ''), values: msg.values ?? {}, turn: msg.turn });
+      return;
+    }
+    await orchestrator.handlePlayerInput(sessionId, playerId, {
+      kind: 'submit',
+      id: String(msg.formId ?? ''),
+      values: msg.values ?? {},
+      turn: msg.turn,
+    });
     return;
   }
 
@@ -289,7 +377,31 @@ async function handleMessage(
       send({ type: 'error', message: 'Game is not in progress.' });
       return;
     }
-    await orchestrator.handleAction(sessionId, playerId, player.name, msg.actionId);
+    if (programGame(session)) {
+      await engineHost.handleInput(sessionId, playerId, { kind: 'action', id: String(msg.actionId ?? ''), turn: msg.turn });
+      return;
+    }
+    await orchestrator.handlePlayerInput(sessionId, playerId, {
+      kind: 'action',
+      id: String(msg.actionId ?? ''),
+      turn: msg.turn,
+    });
+    return;
+  }
+
+  // ── retry_turn ──────────────────────────────────────────────────────────────
+  if (msg.type === 'retry_turn') {
+    if (session.status !== 'playing') {
+      send({ type: 'error', message: 'Game is not in progress.' });
+      return;
+    }
+    // Anyone may retry a stalled turn; otherwise only the host can interrupt.
+    if (!player.isHost && !session.stalled) {
+      send({ type: 'error', message: 'Only the host can ask the AI to continue.' });
+      return;
+    }
+    if (programGame(session)) await engineHost.retry(sessionId, player.name);
+    else await orchestrator.retryTurn(sessionId, player.name);
     return;
   }
 
@@ -299,13 +411,25 @@ async function handleMessage(
       send({ type: 'error', message: 'Only the host can send game adjustments.' });
       return;
     }
-    if (session.status !== 'playing') {
+    // Allowed after game over too: the host can still ask for e.g. a final score screen.
+    if (session.status !== 'playing' && session.status !== 'finished') {
       send({ type: 'error', message: 'Game is not in progress.' });
       return;
     }
     const content = msg.content?.trim();
     if (!content) return;
-    await orchestrator.handleGameTweak(sessionId, player.name, content);
+    if (programGame(session)) await engineHost.requestChange(sessionId, player.name, content);
+    else await orchestrator.handleGameTweak(sessionId, player.name, content);
+    return;
+  }
+
+  // ── patch_decision ────────────────────────────────────────────────────────────
+  if (msg.type === 'patch_decision') {
+    if (!player.isHost) {
+      send({ type: 'error', message: 'Only the host can approve changes.' });
+      return;
+    }
+    await engineHost.decidePatch(sessionId, msg.id, msg.apply === true);
     return;
   }
 
@@ -316,18 +440,19 @@ async function handleMessage(
       return;
     }
 
-    // Cancel any in-flight timers
+    // Cancel any in-flight timers (the game program is kept for "play again")
     orchestrator.cancelAllTimers(sessionId);
+    engineHost.cancel(sessionId);
 
     // Wipe game state but keep definition chat, LLM context, and agreed rules
     // so the confirm banner appears immediately (host can start the same game
     // without another definition round-trip, or keep chatting to change rules)
     const previousRules = session.agreedRules;
     session.status = 'defining';
-    session.stateSchema = undefined;
     session.gameState = {};
     session.playerUi = {};
     session.gameLlmMessages = [];
+    session.turnCounter = 0;
 
     // Append a system message so the chat history shows the reset
     const resetMsg = {
@@ -345,6 +470,10 @@ async function handleMessage(
     connStore.broadcast(sessionId, { type: 'chat_message', message: resetMsg });
     connStore.broadcast(sessionId, { type: 'status_change', status: 'defining', agreedRules: previousRules });
     connStore.broadcast(sessionId, { type: 'ui_update', ui: [] });
+    connStore.broadcast(sessionId, { type: 'turn_status', status: null });
+    connStore.broadcast(sessionId, { type: 'game_error', message: null });
+    connStore.broadcast(sessionId, { type: 'paused', message: null });
+    connStore.broadcast(sessionId, { type: 'patch_proposal', proposal: null });
     console.log(`[ws] Session ${session.joinCode} reset to defining by ${player.name}`);
     return;
   }
@@ -357,21 +486,30 @@ async function handleMessage(
     }
 
     orchestrator.cancelAllTimers(sessionId);
+    engineHost.cancel(sessionId);
 
     // Wipe everything — back to a clean lobby
     session.status = 'lobby';
     session.agreedRules = undefined;
-    session.stateSchema = undefined;
+    session.playerRange = undefined;
     session.gameState = {};
+    session.turnCounter = 0;
     session.playerUi = {};
     session.chatHistory = [];
     session.definitionLlmMessages = [];
     session.gameLlmMessages = [];
+    session.program = undefined;
+    session.programHistory = undefined;
+    session.adjustments = undefined;
     session.updatedAt = new Date().toISOString();
     store.saveSession(session);
 
     connStore.broadcast(sessionId, { type: 'status_change', status: 'lobby' });
+    connStore.broadcast(sessionId, { type: 'paused', message: null });
+    connStore.broadcast(sessionId, { type: 'patch_proposal', proposal: null });
     connStore.broadcast(sessionId, { type: 'ui_update', ui: [] });
+    connStore.broadcast(sessionId, { type: 'turn_status', status: null });
+    connStore.broadcast(sessionId, { type: 'game_error', message: null });
     console.log(`[ws] Session ${session.joinCode} fully reset to lobby by ${player.name}`);
     return;
   }

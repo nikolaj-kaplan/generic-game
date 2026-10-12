@@ -12,6 +12,6 @@
     "resolveJsonModule": true,
     "sourceMap": true
   },
-  "include": ["src/**/*", "../shared/**/*"],
-  "exclude": ["node_modules", "dist"]
+  "include": ["src/**/*", "scripts/**/*", "../shared/**/*"],
+  "exclude": ["node_modules", "dist", "src/engine/guest", "src/engine/presets"]
 }

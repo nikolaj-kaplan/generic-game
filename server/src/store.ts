@@ -1,10 +1,9 @@
 import fs from 'fs';
 import path from 'path';
 import { Session } from './types';
+import { dataDir } from './paths';
 
-// Resolve data directory relative to this source file so it works regardless
-// of which directory the server is started from.
-const DATA_DIR = path.join(__dirname, '../../data');
+const DATA_DIR = dataDir();
 const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
 
 // ─── Ensure data directory exists ────────────────────────────────────────────
@@ -62,6 +61,10 @@ export function saveSession(session: Session): void {
   session.updatedAt = new Date().toISOString();
   sessions.set(session.id, session);
   scheduleSave();
+}
+
+export function allSessions(): Session[] {
+  return Array.from(sessions.values());
 }
 
 export function deleteSession(id: string): void {

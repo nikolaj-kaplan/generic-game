@@ -14,6 +14,10 @@ import {
   ChatMessage,
   UIComponent,
   Player,
+  TurnStatus,
+  PlayerRange,
+  PatchProposal,
+  SavedProgram,
 } from '../types';
 
 // =============================================================================
@@ -27,17 +31,35 @@ interface GameState {
   playerId: string | null;
   chatMessages: ChatMessage[];
   currentUI: UIComponent[];
-  gameState: Record<string, unknown>;
+  /** Turn number of the current screen; echoed back with inputs. Null for intro slides. */
+  currentTurn: number | null;
+  /** Increments on every new screen (used to re-key the renderer). */
+  screenVersion: number;
+  turnStatus: TurnStatus | null;
+  /** Set when the AI failed to produce a screen (Retry is offered). */
+  gameError: string | null;
+  /** Small notification shown briefly, e.g. "Ana answered ✓". */
+  toast: { id: number; text: string } | null;
   agreedRules: string | null;
+  /** How many players the agreed rules need. */
+  playerRange: PlayerRange | null;
   endGameMessage: string | null;
   isAiThinking: boolean;
   expiredTimers: Set<string>;
   errorMessage: string | null;
+  /** Set while the game is on hold (the host is changing it). */
+  paused: string | null;
+  /** Host only: a prepared change waiting for approval. */
+  patchProposal: PatchProposal | null;
+  /** Host only: the program for the agreed rules (saved with them). */
+  program: SavedProgram | null;
 }
 
 interface GameContextValue extends GameState {
   send: (message: ClientMessage) => void;
   clearError: () => void;
+  /** Leave the session for good and go back to the start page. */
+  leaveSession: () => void;
 }
 
 const initialState: GameState = {
@@ -47,18 +69,27 @@ const initialState: GameState = {
   playerId: null,
   chatMessages: [],
   currentUI: [],
-  gameState: {},
+  currentTurn: null,
+  screenVersion: 0,
+  turnStatus: null,
+  gameError: null,
+  toast: null,
   agreedRules: null,
+  playerRange: null,
   endGameMessage: null,
   isAiThinking: false,
   expiredTimers: new Set(),
   errorMessage: null,
+  paused: null,
+  patchProposal: null,
+  program: null,
 };
 
 const GameContext = createContext<GameContextValue>({
   ...initialState,
   send: () => undefined,
   clearError: () => undefined,
+  leaveSession: () => undefined,
 });
 
 // =============================================================================
@@ -81,9 +112,23 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  // Toasts disappear by themselves
+  useEffect(() => {
+    if (!state.toast) return;
+    const id = setTimeout(() => setState((prev) => (prev.toast?.id === state.toast?.id ? { ...prev, toast: null } : prev)), 2500);
+    return () => clearTimeout(id);
+  }, [state.toast]);
+
   const clearError = useCallback(() => {
     setState((prev) => ({ ...prev, errorMessage: null }));
   }, []);
+
+  const leaveSession = useCallback(() => {
+    send({ type: 'leave_session' });
+    localStorage.removeItem('gg_playerId');
+    localStorage.removeItem('gg_joinCode');
+    setState((prev) => ({ ...initialState, connectionStatus: prev.connectionStatus, expiredTimers: new Set() }));
+  }, [send]);
 
   useEffect(() => {
     // Guard against stale reconnect timers created during React StrictMode
@@ -155,8 +200,8 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
               sessionStatus: msg.session.status,
               playerId: msg.playerId,
               chatMessages: msg.session.chatHistory,
-              gameState: msg.session.gameState,
               agreedRules: msg.session.agreedRules ?? null,
+              playerRange: msg.session.playerRange ?? null,
               currentUI: [],
               errorMessage: null,
             };
@@ -173,6 +218,11 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
                 players: [...prev.session.players, msg.player],
               },
             };
+          }
+
+          case 'players_update': {
+            if (!prev.session) return prev;
+            return { ...prev, session: { ...prev.session, players: msg.players } };
           }
 
           case 'player_left': {
@@ -200,12 +250,19 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
             console.log('Components:', msg.ui.map((c) => c.type).join(', '));
             console.log('Full payload:', msg.ui);
             console.groupEnd();
-            return { ...prev, currentUI: msg.ui };
+            return { ...prev, currentUI: msg.ui, currentTurn: msg.turn ?? null, screenVersion: prev.screenVersion + 1 };
           }
 
-          case 'state_update': {
-            console.log('%c[GenericGame] STATE_UPDATE', 'color: #4ade80; font-weight: bold', msg.state);
-            return { ...prev, gameState: msg.state };
+          case 'turn_status': {
+            return { ...prev, turnStatus: msg.status };
+          }
+
+          case 'game_error': {
+            return { ...prev, gameError: msg.message };
+          }
+
+          case 'toast': {
+            return { ...prev, toast: { id: Date.now(), text: msg.text } };
           }
 
           case 'status_change': {
@@ -217,10 +274,16 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
               ...prev,
               sessionStatus: msg.status,
               agreedRules: resetToLobby ? null : (msg.agreedRules !== undefined ? msg.agreedRules : prev.agreedRules),
+              playerRange: resetToLobby ? null : (msg.playerRange !== undefined ? msg.playerRange : msg.agreedRules !== undefined ? null : prev.playerRange),
               endGameMessage: (resetToDefining || resetToLobby) ? null : (msg.message ?? prev.endGameMessage),
-              gameState: (resetToDefining || resetToLobby) ? {} : prev.gameState,
               currentUI: (resetToDefining || resetToLobby) ? [] : prev.currentUI,
+              currentTurn: (resetToDefining || resetToLobby) ? null : prev.currentTurn,
+              turnStatus: (resetToDefining || resetToLobby) ? null : prev.turnStatus,
+              gameError: (resetToDefining || resetToLobby) ? null : prev.gameError,
               chatMessages: resetToLobby ? [] : prev.chatMessages,
+              paused: (resetToDefining || resetToLobby) ? null : prev.paused,
+              patchProposal: (resetToDefining || resetToLobby) ? null : prev.patchProposal,
+              program: resetToLobby ? null : prev.program,
               session: prev.session
                 ? { ...prev.session, status: msg.status }
                 : prev.session,
@@ -231,6 +294,18 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
             const newExpired = new Set(prev.expiredTimers);
             newExpired.add(msg.timerId);
             return { ...prev, expiredTimers: newExpired };
+          }
+
+          case 'paused': {
+            return { ...prev, paused: msg.message };
+          }
+
+          case 'patch_proposal': {
+            return { ...prev, patchProposal: msg.proposal };
+          }
+
+          case 'program_ready': {
+            return { ...prev, program: msg.program };
           }
 
           case 'ai_thinking': {
@@ -256,7 +331,7 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <GameContext.Provider value={{ ...state, send, clearError }}>
+    <GameContext.Provider value={{ ...state, send, clearError, leaveSession }}>
       {children}
     </GameContext.Provider>
   );

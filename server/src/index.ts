@@ -1,8 +1,9 @@
-import path from 'path';
 import dotenv from 'dotenv';
+import { CLIENT_DIST, ENV_FILE } from './paths';
 
-// Load .env from project root — __dirname at runtime is dist/server/src, so 4 levels up
-dotenv.config({ path: path.join(__dirname, '../../../../.env') });
+// Variables already set in the environment win over .env (the playtest
+// harness relies on this to force a local model).
+dotenv.config({ path: ENV_FILE });
 
 import Fastify from 'fastify';
 import fastifyCors from '@fastify/cors';
@@ -10,12 +11,19 @@ import fastifyWebSocket from '@fastify/websocket';
 import fastifyStatic from '@fastify/static';
 import fs from 'fs';
 import { handleConnection } from './ws-handler';
+import { allSessions } from './store';
+import { recoverInterruptedGames } from './llm/orchestrator';
+import { recoverGames } from './engine/host';
 
-const PORT = parseInt(process.env.PORT ?? '3001', 10);
-const CLIENT_DIST = path.join(__dirname, '../../../../client/dist');
+const PORT = parseInt(process.env.PORT ?? '3101', 10);
 
 async function start(): Promise<void> {
-  const app = Fastify({ logger: { level: 'info' } });
+  // Program games re-arm their timers; AI-per-turn games get a Retry button.
+  recoverGames(allSessions());
+  recoverInterruptedGames(allSessions().filter((s) => !s.program));
+
+  // Request logs are noise next to the game logs; LOG_LEVEL=info brings them back.
+  const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'warn' } });
 
   // ── Plugins ────────────────────────────────────────────────────────────────
   await app.register(fastifyCors, { origin: '*' });

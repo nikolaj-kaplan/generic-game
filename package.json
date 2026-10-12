@@ -6,11 +6,18 @@
     "dev:server": "npm run dev --prefix server",
     "dev:client": "npm run dev --prefix client",
     "build": "npm run build --prefix client",
-    "start": "fuser -k 3001/tcp 2>/dev/null; npm run build --prefix client && npm run start --prefix server",
+    "start": "npm run build --prefix client && npm run start --prefix server",
     "install:all": "npm install --prefix server && npm install --prefix client",
-    "logs:clear": "rm -f data/llm-logs/*.json && rm -f data/llm-logs-summary/*.yaml && echo 'LLM logs cleared.'"
+    "logs:clear": "rm -rf data/llm-logs data/llm-logs-summary && echo 'LLM logs cleared.'",
+    "test": "npm test --prefix server",
+    "e2e": "playwright test",
+    "e2e:llm": "E2E_LLM=1 playwright test",
+    "playtest": "npm run playtest --prefix server --",
+    "codegen:eval": "npm run codegen:eval --prefix server --",
+    "play:program": "npm run play:program --prefix server --"
   },
   "devDependencies": {
+    "@playwright/test": "^1.64.0",
     "concurrently": "^8.2.2"
   }
 }

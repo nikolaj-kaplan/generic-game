@@ -1,34 +1,44 @@
 import fs from 'fs';
 import path from 'path';
-import { LLMMessage, LLMTool, LLMResponse } from '../types';
+import { LLMMessage, LLMTool, LLMResponse, GameMetrics } from '../types';
+import { dataDir } from '../paths';
 
-// Resolve log dirs relative to project root regardless of __dirname depth.
-// At runtime __dirname = dist/server/src/llm  → 5 levels to project root
-const LOG_DIR = path.join(__dirname, '../../../../../data/llm-logs');
-const SUMMARY_DIR = path.join(__dirname, '../../../../../data/llm-logs-summary');
+// One folder per definition chat / game run: data/llm-logs/<runDir>/
+// Each LLM exchange writes <seq>_<phase>.json plus a readable .yaml summary.
 
-let _logDirReady = false;
-function ensureLogDir(): void {
-  if (_logDirReady) return;
-  fs.mkdirSync(LOG_DIR, { recursive: true });
-  fs.mkdirSync(SUMMARY_DIR, { recursive: true });
-  _logDirReady = true;
+export type LogPhase = 'definition' | 'playing' | 'generate' | 'patch' | 'ai' | 'unknown';
+
+function logRoot(): string {
+  return path.join(dataDir(), 'llm-logs');
 }
 
-let _seq = 0;
+const seqByDir = new Map<string, number>();
 
-/** Delete all log files in LOG_DIR and SUMMARY_DIR. Called at the start of each new game. */
-export function clearLogs(): void {
+function nextSeq(dir: string): number {
+  let seq = seqByDir.get(dir);
+  if (seq === undefined) {
+    // Continue numbering if the folder already has files (server restart).
+    seq = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('.json') && /^\d+_/.test(f)).length : 0;
+  }
+  seqByDir.set(dir, ++seq);
+  return seq;
+}
+
+/** Build a folder name like 2026-10-10_08-30-00_ABCDE_play */
+export function newLogDirName(joinCode: string, kind: 'define' | 'play' | 'build'): string {
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+  return `${ts}_${joinCode}_${kind}`;
+}
+
+/** Write metrics.json for a game run so model/prompt variants can be compared. */
+export function writeMetrics(runDir: string | undefined, metrics: GameMetrics): void {
   try {
-    ensureLogDir();
-    for (const f of fs.readdirSync(LOG_DIR)) {
-      if (f.endsWith('.json')) fs.unlinkSync(path.join(LOG_DIR, f));
-    }
-    for (const f of fs.readdirSync(SUMMARY_DIR)) {
-      if (f.endsWith('.yaml')) fs.unlinkSync(path.join(SUMMARY_DIR, f));
-    }
-    _seq = 0;
-  } catch { /* non-fatal */ }
+    const dir = path.join(logRoot(), runDir ?? 'unsorted');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'metrics.json'), JSON.stringify(metrics, null, 2));
+  } catch (err) {
+    console.error('[llm-logger] Failed to write metrics:', err);
+  }
 }
 
 /** A message as it appears in log files — tool-call arguments are parsed JSON, not raw strings. */
@@ -41,20 +51,20 @@ type LogMessage = Omit<LLMMessage, 'tool_calls'> & {
 };
 
 export interface LLMLogEntry {
-  seq: number;
   timestamp: string;
   model: string;
-  phase: 'definition' | 'playing' | 'unknown';
+  phase: LogPhase;
   durationMs: number;
   request: {
     systemPrompt: string | null;
     messages: LogMessage[];
     tools: LLMTool[] | null;
-    temperature: number;
+    temperature: number | null;
   };
   response: {
     finishReason: string;
     content: string | null;
+    reasoning?: string;
     toolCalls: Array<{
       id: string;
       name: string;
@@ -144,38 +154,39 @@ function renderUiComponents(components: unknown[], baseIndent: string): string[]
 
 /**
  * Render tool call arguments as readable YAML lines.
- * set_user_ui and run_sequence get special treatment; everything else falls
- * back to a single-line JSON string.
+ * next_turn gets special treatment; everything else falls back to a
+ * single-line JSON string.
  */
 function renderToolArgs(name: string, args: unknown, baseIndent: string): string[] {
   if (typeof args !== 'object' || args === null) return [`${baseIndent}${yamlVal(args, baseIndent)}`];
   const a = args as Record<string, unknown>;
 
-  if (name === 'set_user_ui') {
+  if (name === 'next_turn') {
     const lines: string[] = [];
-    lines.push(`${baseIndent}playerId: ${a.playerId}`);
-    if (Array.isArray(a.ui)) {
-      lines.push(`${baseIndent}ui:`);
-      lines.push(...renderUiComponents(a.ui, baseIndent + '  '));
+    for (const key of ['wait_for', 'timer_seconds', 'rule_change']) {
+      if (a[key] != null) lines.push(`${baseIndent}${key}: ${yamlVal(a[key], baseIndent + '  ')}`);
     }
-    return lines;
-  }
-
-  if (name === 'run_sequence') {
-    const lines: string[] = [];
-    if (Array.isArray(a.steps)) {
-      lines.push(`${baseIndent}steps: # ${(a.steps as unknown[]).length} step(s)`);
-      for (const step of a.steps as Array<Record<string, unknown>>) {
-        lines.push(`${baseIndent}  - action: ${step.action}`);
-        if (step.delayBefore != null) lines.push(`${baseIndent}    delayBefore: ${step.delayBefore}`);
-        if (step.playerId) lines.push(`${baseIndent}    playerId: ${step.playerId}`);
-        if (Array.isArray(step.ui)) {
-          lines.push(`${baseIndent}    ui:`);
-          lines.push(...renderUiComponents(step.ui, baseIndent + '      '));
+    if (a.state_update != null) lines.push(`${baseIndent}state_update: ${yamlVal(a.state_update, baseIndent + '  ')}`);
+    if (Array.isArray(a.intro)) {
+      lines.push(`${baseIndent}intro: # ${a.intro.length} slide(s)`);
+      for (const slide of a.intro as Array<Record<string, unknown>>) {
+        lines.push(`${baseIndent}  - seconds: ${slide.seconds}`);
+        if (Array.isArray(slide.screen)) {
+          lines.push(`${baseIndent}    screen:`);
+          lines.push(...renderUiComponents(slide.screen, baseIndent + '      '));
         }
       }
     }
-    return lines;
+    if (typeof a.screens === 'object' && a.screens !== null) {
+      lines.push(`${baseIndent}screens:`);
+      for (const [target, ui] of Object.entries(a.screens as Record<string, unknown>)) {
+        lines.push(`${baseIndent}  ${target}:`);
+        if (Array.isArray(ui)) lines.push(...renderUiComponents(ui, baseIndent + '    '));
+        else lines.push(`${baseIndent}    ${yamlVal(ui, baseIndent + '    ')}`);
+      }
+    }
+    if (a.game_over != null) lines.push(`${baseIndent}game_over: ${yamlVal(a.game_over, baseIndent + '  ')}`);
+    return lines.length ? lines : [`${baseIndent}${yamlVal(args, baseIndent)}`];
   }
 
   // Default: single-line JSON string
@@ -206,12 +217,12 @@ function summariseMessage(m: LogMessage): string {
   return lines.join('\n');
 }
 
-function writeSummary(filename: string, entry: LLMLogEntry): void {
+function writeSummary(filePath: string, seq: number, entry: LLMLogEntry): void {
   try {
-    ensureLogDir();
     const lines: string[] = [];
-    lines.push(`seq: ${entry.seq}`);
+    lines.push(`seq: ${seq}`);
     lines.push(`phase: ${entry.phase}`);
+    lines.push(`model: ${entry.model}`);
     lines.push(`duration_ms: ${entry.durationMs}`);
     lines.push(`finish_reason: ${entry.response.finishReason}`);
     if (entry.response.usage) {
@@ -227,6 +238,9 @@ function writeSummary(filename: string, entry: LLMLogEntry): void {
       lines.push(summariseMessage(m));
     }
 
+    if (entry.response.reasoning) {
+      lines.push(`response_reasoning: ${yamlStr(entry.response.reasoning, '  ')}`);
+    }
     if (entry.response.toolCalls?.length) {
       lines.push(`response_tool_calls:`);
       for (const tc of entry.response.toolCalls) {
@@ -243,8 +257,7 @@ function writeSummary(filename: string, entry: LLMLogEntry): void {
       lines.push(`response_content: ${yamlStr(entry.response.content, '  ')}`);
     }
 
-    const summaryPath = path.join(SUMMARY_DIR, filename.replace('.json', '.yaml'));
-    fs.writeFileSync(summaryPath, lines.join('\n') + '\n');
+    fs.writeFileSync(filePath, lines.join('\n') + '\n');
   } catch (err) {
     console.error('[llm-logger] Failed to write summary:', err);
   }
@@ -255,19 +268,17 @@ function writeSummary(filename: string, entry: LLMLogEntry): void {
 // =============================================================================
 
 /**
- * Write a structured JSON log file for one LLM exchange.
- * File name: <seq>-<timestamp>-<phase>.json
+ * Write a structured JSON log file (and a YAML summary) for one LLM exchange.
  * Non-blocking — errors are swallowed so logging never crashes the game.
  */
-export function logLLMExchange(entry: LLMLogEntry): void {
+export function logLLMExchange(runDir: string | undefined, entry: LLMLogEntry): void {
   try {
-    ensureLogDir();
-    const seq = String(entry.seq).padStart(5, '0');
-    const ts = entry.timestamp.replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
-    const filename = `${seq}_${ts}_${entry.phase}.json`;
-    const filepath = path.join(LOG_DIR, filename);
-    fs.writeFileSync(filepath, JSON.stringify(entry, null, 2));
-    writeSummary(filename, entry);
+    const dir = path.join(logRoot(), runDir ?? 'unsorted');
+    fs.mkdirSync(dir, { recursive: true });
+    const seq = nextSeq(dir);
+    const base = `${String(seq).padStart(5, '0')}_${entry.phase}`;
+    fs.writeFileSync(path.join(dir, `${base}.json`), JSON.stringify(entry, null, 2));
+    writeSummary(path.join(dir, `${base}.yaml`), seq, entry);
   } catch (err) {
     console.error('[llm-logger] Failed to write log:', err);
   }
@@ -280,24 +291,18 @@ function parseTcArgs(raw: string): unknown {
 
 /** Build a LLMLogEntry from a completed (or failed) exchange. */
 export function buildLogEntry(opts: {
-  seq: number;
   timestamp: string;
   model: string;
+  phase: LogPhase;
   messages: LLMMessage[];
   tools: LLMTool[] | undefined;
-  temperature: number;
+  temperature: number | undefined;
   durationMs: number;
   response?: LLMResponse;
   error?: string;
 }): LLMLogEntry {
-  // Detect phase from system message content
   const systemMsg = opts.messages.find((m) => m.role === 'system');
   const systemContent = typeof systemMsg?.content === 'string' ? systemMsg.content : null;
-  let phase: LLMLogEntry['phase'] = 'unknown';
-  if (systemContent) {
-    if (systemContent.includes('AGREED RULES')) phase = 'playing';
-    else if (systemContent.includes('setup assistant')) phase = 'definition';
-  }
 
   const toolCalls = opts.response?.choices[0]?.message?.tool_calls
     ? opts.response.choices[0].message.tool_calls.map((tc) => ({
@@ -328,27 +333,23 @@ export function buildLogEntry(opts: {
     });
 
   return {
-    seq: opts.seq,
     timestamp: opts.timestamp,
     model: opts.model,
-    phase,
+    phase: opts.phase,
     durationMs: opts.durationMs,
     request: {
       systemPrompt: systemContent,
       messages: nonSystemMessages,
       tools: opts.tools ?? null,
-      temperature: opts.temperature,
+      temperature: opts.temperature ?? null,
     },
     response: {
       finishReason: opts.response?.choices[0]?.finish_reason ?? 'error',
       content: opts.response?.choices[0]?.message?.content ?? null,
+      reasoning: opts.response?.choices[0]?.message?.reasoning,
       toolCalls,
       usage: opts.response?.usage,
     },
     ...(opts.error ? { error: opts.error } : {}),
   };
-}
-
-export function nextSeq(): number {
-  return ++_seq;
 }

@@ -12,11 +12,13 @@ interface UIRendererProps {
  * when the LLM doesn't wrap them in a `form`.
  */
 export default function UIRenderer({ components }: UIRendererProps) {
-  const { send } = useGame();
+  const { send, currentTurn, expiredTimers } = useGame();
   // Shared state for standalone (top-level) inputs
   const [topInputValues, setTopInputValues] = useState<Record<string, string>>({});
   // Tracks which multiple_choice fieldIds have been submitted this screen
   const [submittedChoices, setSubmittedChoices] = useState<Record<string, string>>({});
+  // One response per screen: everything is disabled after the first submit
+  const [locked, setLocked] = useState(false);
 
   // Reset all interaction state whenever the UI changes (new screen from LLM)
   const prevComponents = useRef(components);
@@ -24,41 +26,72 @@ export default function UIRenderer({ components }: UIRendererProps) {
     if (prevComponents.current !== components) {
       setTopInputValues({});
       setSubmittedChoices({});
+      setLocked(false);
       prevComponents.current = components;
     }
   }, [components]);
+
+  const turn = currentTurn ?? undefined;
+
+  // When this screen's countdown reaches zero the turn is over: lock the inputs.
+  const countdown = components.find((c): c is UIComponent & { type: 'countdown' } => c.type === 'countdown');
+  const [timeUp, setTimeUp] = useState(false);
+  useEffect(() => {
+    if (!countdown) return;
+    if (expiredTimers.has(countdown.timerId)) {
+      setTimeUp(true);
+      return;
+    }
+    if (!countdown.endsAt) return;
+    const check = () => setTimeUp(Date.now() >= countdown.endsAt!);
+    check();
+    const id = setInterval(check, 250);
+    return () => clearInterval(id);
+  }, [countdown, expiredTimers]);
+  const inputsLocked = locked || timeUp;
 
   function handleTopInputChange(fieldId: string, value: string) {
     setTopInputValues((prev) => ({ ...prev, [fieldId]: value }));
   }
 
   function handleTopButtonClick(actionId: string) {
+    if (locked || timeUp) return;
+    setLocked(true);
     if (Object.keys(topInputValues).length > 0) {
       // Treat as a form submission so the server carries the input values
-      send({ type: 'form_submit', formId: actionId, values: topInputValues });
-      setTopInputValues({});
+      send({ type: 'form_submit', formId: actionId, values: topInputValues, turn });
     } else {
-      send({ type: 'action', actionId });
+      send({ type: 'action', actionId, turn });
     }
   }
 
   function handleChoiceSubmit(fieldId: string, option: string) {
-    if (submittedChoices[fieldId]) return;
+    if (locked || timeUp || submittedChoices[fieldId]) return;
+    setLocked(true);
     setSubmittedChoices((prev) => ({ ...prev, [fieldId]: option }));
-    send({ type: 'form_submit', formId: fieldId, values: { [fieldId]: option } });
+    send({ type: 'form_submit', formId: fieldId, values: { [fieldId]: option }, turn });
+  }
+
+  function handleFormSubmit(formId: string, values: Record<string, string>) {
+    if (locked || timeUp) return;
+    setLocked(true);
+    send({ type: 'form_submit', formId, values, turn });
   }
 
   return (
     <div className="ui-renderer">
+      {timeUp && !locked && <p className="time-up">⏰ Time's up!</p>}
       {components.map((comp, i) => (
         <UIComponentNode
           key={i}
           component={comp}
+          locked={inputsLocked}
           topInputValues={topInputValues}
           onTopInputChange={handleTopInputChange}
           onTopButtonClick={handleTopButtonClick}
           submittedChoices={submittedChoices}
           onChoiceSubmit={handleChoiceSubmit}
+          onFormSubmit={handleFormSubmit}
         />
       ))}
     </div>
@@ -67,14 +100,16 @@ export default function UIRenderer({ components }: UIRendererProps) {
 
 interface NodeProps {
   component: UIComponent;
+  locked: boolean;
   topInputValues: Record<string, string>;
   onTopInputChange: (fieldId: string, value: string) => void;
   onTopButtonClick: (actionId: string) => void;
   submittedChoices: Record<string, string>;
   onChoiceSubmit: (fieldId: string, option: string) => void;
+  onFormSubmit: (formId: string, values: Record<string, string>) => void;
 }
 
-function UIComponentNode({ component: comp, topInputValues, onTopInputChange, onTopButtonClick, submittedChoices, onChoiceSubmit }: NodeProps) {
+function UIComponentNode({ component: comp, locked, topInputValues, onTopInputChange, onTopButtonClick, submittedChoices, onChoiceSubmit, onFormSubmit }: NodeProps) {
   switch (comp.type) {
     case 'text':
       return <TextComponent content={comp.content} style={comp.style} />;
@@ -91,6 +126,7 @@ function UIComponentNode({ component: comp, topInputValues, onTopInputChange, on
               maxLength={comp.maxLength}
               value={topInputValues[comp.fieldId] ?? ''}
               onChange={(e) => onTopInputChange(comp.fieldId, e.target.value)}
+              disabled={locked}
               rows={3}
               autoFocus
             />
@@ -102,6 +138,16 @@ function UIComponentNode({ component: comp, topInputValues, onTopInputChange, on
               maxLength={comp.maxLength}
               value={topInputValues[comp.fieldId] ?? ''}
               onChange={(e) => onTopInputChange(comp.fieldId, e.target.value)}
+              onKeyDown={(e) => {
+                // Enter presses the Submit button (the engine adds one to text screens), or the only button
+                if (e.key === 'Enter' && !locked) {
+                  const buttons = document.querySelectorAll<HTMLButtonElement>('.ui-renderer > .btn');
+                  const submit = document.querySelector<HTMLButtonElement>('.ui-renderer > .btn[data-action="submit"]');
+                  if (submit) submit.click();
+                  else if (buttons.length === 1) buttons[0].click();
+                }
+              }}
+              disabled={locked}
               autoFocus
             />
           )}
@@ -112,7 +158,8 @@ function UIComponentNode({ component: comp, topInputValues, onTopInputChange, on
       return (
         <button
           className={`btn btn--${comp.style ?? 'primary'} btn--full`}
-          disabled={comp.disabled}
+          data-action={comp.actionId}
+          disabled={comp.disabled || locked}
           onClick={() => onTopButtonClick(comp.actionId)}
         >
           {comp.label}
@@ -120,16 +167,17 @@ function UIComponentNode({ component: comp, topInputValues, onTopInputChange, on
       );
 
     case 'multiple_choice':
-      return <MultipleChoice comp={comp} selected={submittedChoices[comp.fieldId] ?? null} onSelect={onChoiceSubmit} />;
+      return <MultipleChoice comp={comp} selected={submittedChoices[comp.fieldId] ?? null} disabled={locked} onSelect={onChoiceSubmit} />;
 
     case 'countdown':
-      return <Countdown comp={comp} />;
+      // Once this player has answered, their timer is no longer relevant.
+      return locked ? null : <Countdown comp={comp} />;
 
     case 'scoreboard':
       return <Scoreboard players={comp.players} />;
 
     case 'form':
-      return <Form comp={comp} />;
+      return <Form comp={comp} locked={locked} onSubmit={onFormSubmit} />;
 
     case 'list':
       return <ListComponent items={comp.items} ordered={comp.ordered} />;
@@ -173,10 +221,12 @@ function TextComponent({
 function MultipleChoice({
   comp,
   selected,
+  disabled,
   onSelect,
 }: {
   comp: UIComponent & { type: 'multiple_choice' };
   selected: string | null;
+  disabled: boolean;
   onSelect: (fieldId: string, option: string) => void;
 }) {
   return (
@@ -186,9 +236,9 @@ function MultipleChoice({
         {comp.options.map((opt) => {
           let cls = 'mc__option';
           if (selected === opt) cls += ' mc__option--selected';
-          else if (selected !== null) cls += ' mc__option--disabled';
+          else if (selected !== null || disabled) cls += ' mc__option--disabled';
           return (
-            <button key={opt} className={cls} onClick={() => onSelect(comp.fieldId, opt)} disabled={selected !== null}>
+            <button key={opt} className={cls} onClick={() => onSelect(comp.fieldId, opt)} disabled={selected !== null || disabled}>
               {opt}
             </button>
           );
@@ -204,26 +254,41 @@ function MultipleChoice({
 // =============================================================================
 
 function Countdown({ comp }: { comp: UIComponent & { type: 'countdown' } }) {
-  const { expiredTimers } = useGame();
-  const [remaining, setRemaining] = useState(comp.seconds);
+  const { expiredTimers, isAiThinking } = useGame();
+  // endsAt (set by the server) keeps the countdown right after a reconnect
+  const secondsLeft = () =>
+    comp.endsAt ? Math.max(0, Math.ceil((comp.endsAt - Date.now()) / 1000)) : comp.seconds;
+  const [remaining, setRemaining] = useState(secondsLeft);
   const expired = expiredTimers.has(comp.timerId);
 
   useEffect(() => {
-    if (expired || remaining <= 0) return;
+    setRemaining(secondsLeft());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [comp.timerId, comp.endsAt]);
+
+  useEffect(() => {
+    // Frozen while the AI works on the next screen (the turn has already ended).
+    if (expired || remaining <= 0 || isAiThinking) return;
     const id = setInterval(() => {
-      setRemaining((prev) => Math.max(0, prev - 1));
+      setRemaining(comp.endsAt ? secondsLeft() : (prev) => Math.max(0, prev - 1));
     }, 1000);
     return () => clearInterval(id);
-  }, [expired, remaining]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expired, remaining, comp.endsAt, isAiThinking]);
 
-  const isUrgent = remaining <= 5 && !expired;
+  // Once time is up the AI takes over; a frozen "0s" box only adds noise.
+  if (expired || remaining <= 0) return null;
+
+  const isUrgent = remaining <= 5;
+  const fraction = Math.max(0, Math.min(1, remaining / comp.seconds));
 
   return (
-    <div className={`countdown ${isUrgent ? 'countdown--urgent' : ''} ${expired ? 'countdown--expired' : ''}`}>
+    <div className={`countdown ${isUrgent ? 'countdown--urgent' : ''}`}>
       <span className="countdown__label">{comp.label ?? 'Time remaining'}</span>
-      <span className="countdown__time">
-        {expired ? '0' : remaining}s
-      </span>
+      <span className="countdown__time">{remaining}s</span>
+      <div className="countdown__bar" aria-hidden="true">
+        <span style={{ transform: `scaleX(${fraction})` }} />
+      </div>
     </div>
   );
 }
@@ -253,8 +318,15 @@ function Scoreboard({ players }: { players: Array<{ id: string; name: string; sc
 // Form
 // =============================================================================
 
-function Form({ comp }: { comp: UIComponent & { type: 'form' } }) {
-  const { send } = useGame();
+function Form({
+  comp,
+  locked,
+  onSubmit,
+}: {
+  comp: UIComponent & { type: 'form' };
+  locked: boolean;
+  onSubmit: (formId: string, values: Record<string, string>) => void;
+}) {
   const [values, setValues] = useState<Record<string, string>>({});
   const [submitted, setSubmitted] = useState(false);
 
@@ -264,9 +336,9 @@ function Form({ comp }: { comp: UIComponent & { type: 'form' } }) {
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (submitted) return;
+    if (submitted || locked) return;
     setSubmitted(true);
-    send({ type: 'form_submit', formId: comp.formId, values });
+    onSubmit(comp.formId, values);
   }
 
   return (
@@ -277,13 +349,13 @@ function Form({ comp }: { comp: UIComponent & { type: 'form' } }) {
           field={field}
           value={values[(field as { fieldId?: string }).fieldId ?? ''] ?? ''}
           onChange={handleChange}
-          disabled={submitted}
+          disabled={submitted || locked}
         />
       ))}
       <button
         className="btn btn--primary btn--full"
         type="submit"
-        disabled={submitted}
+        disabled={submitted || locked}
       >
         {comp.submitLabel ?? 'Submit'}
       </button>

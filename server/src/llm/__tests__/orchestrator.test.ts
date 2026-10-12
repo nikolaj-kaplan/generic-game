@@ -1,13 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import type { Session } from '../../types';
-import type { LLMResponse } from '../../types';
+import type { Session, LLMResponse, ServerMessage } from '../../types';
 
 // ─── Module mocks (hoisted before imports) ────────────────────────────────────
 
-vi.mock('../client', () => ({ chat: vi.fn() }));
-vi.mock('../logger', () => ({ clearLogs: vi.fn(), logLLMExchange: vi.fn(), buildLogEntry: vi.fn(), nextSeq: vi.fn(() => 1) }));
-vi.mock('../prompts', () => ({ playingPrompt: vi.fn(() => 'system'), definitionPrompt: vi.fn(() => 'system') }));
-vi.mock('../tools', () => ({ gameTools: [], definitionTools: [] }));
+const cfg = vi.hoisted(() => ({ protocol: 'tools' as 'tools' | 'json' }));
+vi.mock('../client', () => ({ chat: vi.fn(), llmConfig: () => ({ model: 'mock-model', protocol: cfg.protocol }) }));
+vi.mock('../logger', () => ({ newLogDirName: vi.fn(() => 'test-run'), writeMetrics: vi.fn() }));
 
 // store: real in-memory map, no disk I/O
 vi.mock('../../store', () => {
@@ -20,7 +18,7 @@ vi.mock('../../store', () => {
   };
 });
 
-// connection-store: capture broadcast calls
+// connection-store: capture what each player receives
 vi.mock('../../connection-store', () => ({
   broadcast: vi.fn(),
   sendToPlayer: vi.fn(),
@@ -35,58 +33,47 @@ vi.mock('../../connection-store', () => ({
 import { chat } from '../client';
 import * as connStore from '../../connection-store';
 import * as store from '../../store';
-import { handleAction, handleFormSubmit, cancelAllTimers } from '../orchestrator';
+import { handlePlayerInput, startGame, retryTurn, handleGameTweak, cancelAllTimers, recoverInterruptedGames, resendState } from '../orchestrator';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const mockedChat = vi.mocked(chat);
 const mockedBroadcast = vi.mocked(connStore.broadcast);
+const mockedSendToPlayer = vi.mocked(connStore.sendToPlayer);
 
-/** Build an LLMResponse that returns one or more tool calls. */
-function toolCallResponse(calls: Array<{ name: string; args: object }>): LLMResponse {
+function nextTurn(args: object): LLMResponse {
   return {
     id: 'mock',
     choices: [{
       message: {
         role: 'assistant',
         content: null,
-        tool_calls: calls.map((c, i) => ({
-          id: `tc-${i}`,
-          type: 'function' as const,
-          function: { name: c.name, arguments: JSON.stringify(c.args) },
-        })),
+        tool_calls: [{ id: `tc-${Math.random()}`, type: 'function', function: { name: 'next_turn', arguments: JSON.stringify(args) } }],
       },
       finish_reason: 'tool_calls',
     }],
   };
 }
 
-/** Build an LLMResponse with no tool calls (plain stop). */
-function stopResponse(content = ''): LLMResponse {
-  return {
-    id: 'mock',
-    choices: [{ message: { role: 'assistant', content, tool_calls: undefined }, finish_reason: 'stop' }],
-  };
+function textReply(content: string): LLMResponse {
+  return { id: 'mock', choices: [{ message: { role: 'assistant', content }, finish_reason: 'stop' }] };
 }
 
-const INTERACTIVE_UI = [
-  { type: 'text' as const, content: 'Question', style: 'body' as const },
-  { type: 'button' as const, label: 'Submit', actionId: 'submit', style: 'primary' as const },
+const QUESTION = [
+  { type: 'text', content: 'Question 1' },
+  { type: 'multiple_choice', fieldId: 'answer', question: '2+2?', options: ['3', '4'] },
 ];
-
-const NON_INTERACTIVE_UI = [
-  { type: 'text' as const, content: 'Loading…', style: 'body' as const },
-];
+const NEXT_BUTTON = [{ type: 'button', label: 'Next', actionId: 'next' }];
 
 function makeSession(overrides: Partial<Session> = {}): Session {
   return {
     id: 'session-1',
     joinCode: 'TEST',
     status: 'playing',
-    players: [{
-      id: 'player-1', name: 'nik', isHost: true,
-      connectedAt: ''
-    }],
+    players: [
+      { id: 'p1', name: 'Ana', isHost: true, connectedAt: '' },
+      { id: 'p2', name: 'Bob', isHost: false, connectedAt: '' },
+    ],
     chatHistory: [],
     definitionLlmMessages: [],
     gameLlmMessages: [],
@@ -99,288 +86,519 @@ function makeSession(overrides: Partial<Session> = {}): Session {
   };
 }
 
-function seedSession(session: Session) {
-  store.saveSession(session);
+const getSession = () => store.getSession('session-1')!;
+
+function uiSentTo(playerId: string): Array<Extract<ServerMessage, { type: 'ui_update' }>> {
+  return mockedSendToPlayer.mock.calls
+    .filter(([, id, msg]) => id === playerId && msg.type === 'ui_update')
+    .map(([, , msg]) => msg as Extract<ServerMessage, { type: 'ui_update' }>);
 }
 
 function broadcastsOfType(type: string) {
   return mockedBroadcast.mock.calls.filter(([, msg]) => msg.type === type);
 }
 
-// ─── Setup / teardown ─────────────────────────────────────────────────────────
+/** Start a game whose first screen is `args`; returns the turn number. */
+async function startWith(args: object, sessionOverrides: Partial<Session> = {}) {
+  store.saveSession(makeSession({ status: 'defining', ...sessionOverrides }));
+  mockedChat.mockResolvedValueOnce(nextTurn(args));
+  await startGame('session-1');
+  return getSession().pendingTurn?.turn;
+}
 
 beforeEach(() => {
-  // resetAllMocks clears call history AND the mockResolvedValueOnce queue,
-  // preventing responses from one test bleeding into the next.
+  cfg.protocol = 'tools';
+  process.env.LLM_PREFETCH = 'false';
   vi.resetAllMocks();
-  const s = (store as unknown as { __sessions: Map<string, Session> }).__sessions;
-  s.clear();
+  (store as unknown as { __sessions: Map<string, Session> }).__sessions.clear();
 });
 
 afterEach(() => {
   cancelAllTimers('session-1');
-  // Restore real timers even if a test threw before reaching vi.useRealTimers()
   vi.useRealTimers();
 });
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
-describe('game loop — set_user_ui breaks loop', () => {
-  it('stops the loop immediately after a direct set_user_ui call', async () => {
-    seedSession(makeSession());
-
-    // LLM responds with set_user_ui once, then a stop (should never be reached)
-    mockedChat
-      .mockResolvedValueOnce(toolCallResponse([{ name: 'set_user_ui', args: { playerId: 'all', ui: INTERACTIVE_UI } }]))
-      .mockResolvedValueOnce(stopResponse()); // safety net — must NOT be called
-
-    await handleAction('session-1', 'player-1', 'nik', 'some_action');
-
-    // chat should have been called exactly once — loop broke before second call
+describe('starting a game', () => {
+  it('makes one LLM call and shows the screen to every player', async () => {
+    const turn = await startWith({ state_update: { round: 1 }, screens: { all: QUESTION } });
     expect(mockedChat).toHaveBeenCalledTimes(1);
-    // exactly one ui_update broadcast
-    expect(broadcastsOfType('ui_update')).toHaveLength(1);
+    expect(turn).toBe(1);
+    expect(uiSentTo('p1')).toHaveLength(1);
+    expect(uiSentTo('p2')).toHaveLength(1);
+    expect(getSession().gameState).toEqual({ round: 1 });
   });
 
-  it('prevents the LLM from overwriting its own UI in a subsequent iteration', async () => {
-    seedSession(makeSession());
-
-    // Without the fix, the LLM would be called twice and broadcast two ui_updates
-    mockedChat
-      .mockResolvedValueOnce(toolCallResponse([{ name: 'set_user_ui', args: { playerId: 'all', ui: INTERACTIVE_UI } }]))
-      .mockResolvedValueOnce(toolCallResponse([{ name: 'set_user_ui', args: { playerId: 'all', ui: NON_INTERACTIVE_UI } }]));
-
-    await handleAction('session-1', 'player-1', 'nik', 'some_action');
-
-    expect(mockedChat).toHaveBeenCalledTimes(1);
-    const uiUpdates = broadcastsOfType('ui_update');
-    expect(uiUpdates).toHaveLength(1);
-    // The first (and only) UI is the interactive one
-    expect((uiUpdates[0][1] as { ui: unknown[] }).ui).toEqual(INTERACTIVE_UI);
+  it('forces a tool call in the playing phase', async () => {
+    await startWith({ screens: { all: QUESTION } });
+    expect(mockedChat.mock.calls[0][0].toolChoice).toBe('required');
   });
 
-  it('allows set_state and set_user_ui to be batched in the same iteration', async () => {
-    seedSession(makeSession());
+  it('never sends game state to clients', async () => {
+    await startWith({ state_update: { secret: 'Zanzibar' }, screens: { all: QUESTION } });
+    const everything = JSON.stringify([...mockedBroadcast.mock.calls, ...mockedSendToPlayer.mock.calls]);
+    expect(everything).not.toContain('Zanzibar');
+  });
 
-    mockedChat.mockResolvedValueOnce(
-      toolCallResponse([
-        { name: 'set_state', args: { state: { score: 10 } } },
-        { name: 'set_user_ui', args: { playerId: 'all', ui: INTERACTIVE_UI } },
-      ]),
-    );
-
-    await handleAction('session-1', 'player-1', 'nik', 'submit');
-
-    expect(mockedChat).toHaveBeenCalledTimes(1);
-    expect(broadcastsOfType('state_update')).toHaveLength(1);
-    expect(broadcastsOfType('ui_update')).toHaveLength(1);
+  it('sends the state with the latest event, not in the system prompt', async () => {
+    await startWith({ state_update: { secret: 'Zanzibar' }, screens: { all: QUESTION } });
+    mockedChat.mockResolvedValueOnce(nextTurn({ screens: { all: QUESTION } }));
+    await handlePlayerInput('session-1', 'p1', { kind: 'submit', id: 'answer', values: { answer: '4' }, turn: 1 });
+    const messages = mockedChat.mock.calls[1][0].messages;
+    expect(messages[0].content).not.toContain('Zanzibar');
+    expect(messages[messages.length - 1].content).toContain('"secret":"Zanzibar"');
   });
 });
 
-describe('game loop — run_sequence does NOT break loop', () => {
-  it('continues after run_sequence so the LLM can do follow-up work', async () => {
-    seedSession(makeSession());
-
+describe('validation and retries', () => {
+  it('sends validation errors back and keeps only the successful exchange', async () => {
+    store.saveSession(makeSession({ status: 'defining' }));
     mockedChat
-      // Iteration 1: run_sequence (delayBefore omitted → no sleep)
-      .mockResolvedValueOnce(toolCallResponse([{
-        name: 'run_sequence',
-        args: {
-          steps: [
-            { action: 'set_ui', playerId: 'all', ui: NON_INTERACTIVE_UI },
-          ],
-        },
-      }]))
-      // Iteration 2: LLM does follow-up set_user_ui → loop breaks
-      .mockResolvedValueOnce(toolCallResponse([{
-        name: 'set_user_ui',
-        args: { playerId: 'all', ui: INTERACTIVE_UI },
-      }]));
-
-    await handleAction('session-1', 'player-1', 'nik', 'some_action');
-
-    // chat called TWICE — loop continued after run_sequence
-    expect(mockedChat).toHaveBeenCalledTimes(2);
-    // ui_update from run_sequence step + ui_update from set_user_ui
-    expect(broadcastsOfType('ui_update')).toHaveLength(2);
-  });
-
-  it('executes all delayed steps inside run_sequence before continuing', async () => {
-    seedSession(makeSession());
-
-    const order: string[] = [];
-
-    mockedChat
-      .mockResolvedValueOnce(toolCallResponse([{
-        name: 'run_sequence',
-        args: {
-          steps: [
-            { action: 'set_ui', playerId: 'all', ui: NON_INTERACTIVE_UI },
-            // delayBefore: 0 → no real sleep but tests step ordering
-            { action: 'set_state', state: { phase: 'result' } },
-          ],
-        },
-      }]))
-      .mockImplementationOnce(async () => {
-        order.push('llm-iteration-2');
-        return toolCallResponse([{ name: 'set_user_ui', args: { playerId: 'all', ui: INTERACTIVE_UI } }]);
-      });
-
-    // Capture broadcast order
-    mockedBroadcast.mockImplementation((_, msg) => {
-      if (msg.type === 'ui_update' || msg.type === 'state_update') order.push(msg.type);
-    });
-
-    await handleAction('session-1', 'player-1', 'nik', 'next');
-
-    // sequence steps execute before the next LLM call
-    expect(order).toEqual(['ui_update', 'state_update', 'llm-iteration-2', 'ui_update']);
-  });
-});
-
-describe('game loop — run_sequence with delayBefore', () => {
-  it('respects delayBefore timing before broadcasting each step', async () => {
-    vi.useFakeTimers();
-    seedSession(makeSession());
-
-    const uiUpdates: unknown[] = [];
-    mockedBroadcast.mockImplementation((_, msg) => {
-      if (msg.type === 'ui_update') uiUpdates.push((msg as { ui: unknown }).ui);
-    });
-
-    mockedChat
-      .mockResolvedValueOnce(toolCallResponse([{
-        name: 'run_sequence',
-        args: {
-          steps: [
-            { action: 'set_ui', playerId: 'all', ui: NON_INTERACTIVE_UI },
-            { action: 'set_ui', playerId: 'all', ui: INTERACTIVE_UI, delayBefore: 2 },
-          ],
-        },
-      }]))
-      .mockResolvedValueOnce(stopResponse());
-
-    const actionPromise = handleAction('session-1', 'player-1', 'nik', 'go');
-
-    // Before advancing timers: first step already rendered, second still pending
-    await vi.runAllTimersAsync();
-    await actionPromise;
-
-    expect(uiUpdates).toHaveLength(2);
-    expect(uiUpdates[0]).toEqual(NON_INTERACTIVE_UI);
-    expect(uiUpdates[1]).toEqual(INTERACTIVE_UI);
-
-    vi.useRealTimers();
-  });
-});
-
-describe('game loop — start_timer + set_user_ui', () => {
-  it('registers the timer and breaks the loop in the same iteration', async () => {
-    vi.useFakeTimers();
-    seedSession(makeSession());
-
-    mockedChat
-      // Iteration 1: set a countdown UI and start a timer
-      .mockResolvedValueOnce(toolCallResponse([
-        { name: 'set_user_ui', args: { playerId: 'all', ui: NON_INTERACTIVE_UI } },
-        { name: 'start_timer', args: { timerId: 'round-timer', seconds: 5 } },
-      ]))
-      // Called when timer fires
-      .mockResolvedValueOnce(toolCallResponse([
-        { name: 'set_user_ui', args: { playerId: 'all', ui: INTERACTIVE_UI } },
-      ]));
-
-    await handleAction('session-1', 'player-1', 'nik', 'start');
-
-    // Loop broke after first iteration — only 1 LLM call so far
-    expect(mockedChat).toHaveBeenCalledTimes(1);
-    expect(broadcastsOfType('ui_update')).toHaveLength(1);
-
-    // Advance timer — should trigger a second game loop run
-    await vi.runAllTimersAsync();
+      .mockResolvedValueOnce(nextTurn({ screens: { all: [{ type: 'image', src: 'x.png' }] } }))
+      .mockResolvedValueOnce(nextTurn({ screens: { all: QUESTION } }));
+    await startGame('session-1');
 
     expect(mockedChat).toHaveBeenCalledTimes(2);
-    expect(broadcastsOfType('ui_update')).toHaveLength(2);
+    const retryMessages = mockedChat.mock.calls[1][0].messages;
+    expect(retryMessages[retryMessages.length - 1].content).toContain('unknown type');
+    // history: start event + one successful call + its result
+    expect(getSession().gameLlmMessages.map((m) => m.role)).toEqual(['user', 'assistant', 'tool']);
+    expect(getSession().metrics?.invalidCalls).toBe(1);
+  });
 
-    vi.useRealTimers();
+  it('nudges after a text reply and accepts next_turn written as JSON text', async () => {
+    store.saveSession(makeSession({ status: 'defining' }));
+    mockedChat
+      .mockResolvedValueOnce(textReply('Let me think about the game...'))
+      .mockResolvedValueOnce(textReply(JSON.stringify({ name: 'next_turn', arguments: { screens: { all: QUESTION } } })));
+    await startGame('session-1');
+    expect(getSession().pendingTurn?.turn).toBe(1);
+    expect(getSession().metrics?.textReplies).toBe(1);
+  });
+
+  it('stalls after repeated failures and recovers on retry', async () => {
+    store.saveSession(makeSession({ status: 'defining' }));
+    mockedChat.mockResolvedValue(textReply('no idea'));
+    await startGame('session-1');
+    expect(getSession().stalled).toBeTruthy();
+    expect(broadcastsOfType('game_error').some(([, m]) => (m as { message: string | null }).message)).toBe(true);
+
+    mockedChat.mockReset();
+    mockedChat.mockResolvedValueOnce(nextTurn({ screens: { all: QUESTION } }));
+    await retryTurn('session-1', 'Ana');
+    expect(getSession().stalled).toBeUndefined();
+    expect(getSession().pendingTurn).toBeDefined();
+  });
+
+  it('reports HTTP errors as a stall instead of crashing', async () => {
+    store.saveSession(makeSession({ status: 'defining' }));
+    mockedChat.mockRejectedValue(new Error('LLM error 500'));
+    vi.useFakeTimers();
+    const p = startGame('session-1');
+    await vi.runAllTimersAsync();
+    await p;
+    expect(getSession().stalled).toContain('500');
   });
 });
 
-describe('game loop — end_game', () => {
-  it('stops the loop and broadcasts finished status', async () => {
-    seedSession(makeSession());
+describe('waiting for players', () => {
+  it('wait_for "any" resolves on the first response', async () => {
+    await startWith({ screens: { all: QUESTION } });
+    mockedChat.mockResolvedValueOnce(nextTurn({ screens: { all: NEXT_BUTTON } }));
+    await handlePlayerInput('session-1', 'p2', { kind: 'submit', id: 'answer', values: { answer: '4' }, turn: 1 });
+    expect(mockedChat).toHaveBeenCalledTimes(2);
+    const event = mockedChat.mock.calls[1][0].messages.at(-1)!.content!;
+    expect(event).toContain('Bob (p2) answered "4"');
+  });
 
-    mockedChat
-      .mockResolvedValueOnce(toolCallResponse([{
-        name: 'end_game',
-        args: { message: 'You win!', results: { winner: 'nik' } },
-      }]))
-      .mockResolvedValueOnce(stopResponse()); // must NOT be called
-
-    await handleAction('session-1', 'player-1', 'nik', 'final_answer');
-
+  it('wait_for "all" collects every answer into one event', async () => {
+    await startWith({ screens: { all: QUESTION }, wait_for: 'all' });
+    await handlePlayerInput('session-1', 'p1', { kind: 'submit', id: 'answer', values: { answer: '3' }, turn: 1 });
     expect(mockedChat).toHaveBeenCalledTimes(1);
-    const statusChanges = broadcastsOfType('status_change');
-    expect(statusChanges).toHaveLength(1);
-    expect((statusChanges[0][1] as { status: string }).status).toBe('finished');
-  });
-});
+    // Ana's screen is locked while waiting
+    const lockedUi = uiSentTo('p1').at(-1)!.ui;
+    expect(lockedUi.some((c) => c.type === 'multiple_choice')).toBe(false);
+    expect(broadcastsOfType('turn_status').at(-1)![1]).toMatchObject({ status: { waitingFor: ['Bob'], answered: ['Ana'] } });
 
-describe('game loop — error handling', () => {
-  it('injects a retry nudge after two consecutive iterations with errors', async () => {
-    seedSession(makeSession());
-
-    mockedChat
-      // Iteration 1: call unknown tool → error
-      .mockResolvedValueOnce(toolCallResponse([{ name: 'bad_tool', args: {} }]))
-      // Iteration 2: call unknown tool again → error → nudge injected
-      .mockResolvedValueOnce(toolCallResponse([{ name: 'bad_tool', args: {} }]))
-      // Iteration 3: stop
-      .mockResolvedValueOnce(stopResponse());
-
-    await handleAction('session-1', 'player-1', 'nik', 'go');
-
-    const session = store.getSession('session-1')!;
-    // The nudge is injected as a user role message in the LLM history
-    const nudgeMessages = session.gameLlmMessages.filter(
-      (m) => m.role === 'user' && typeof m.content === 'string' && m.content.startsWith('SYSTEM:'),
-    );
-    expect(nudgeMessages.length).toBeGreaterThanOrEqual(1);
+    mockedChat.mockResolvedValueOnce(nextTurn({ screens: { all: NEXT_BUTTON } }));
+    await handlePlayerInput('session-1', 'p2', { kind: 'submit', id: 'answer', values: { answer: '4' }, turn: 1 });
+    expect(mockedChat).toHaveBeenCalledTimes(2);
+    const event = mockedChat.mock.calls[1][0].messages.at(-1)!.content!;
+    expect(event).toContain('all players responded');
+    expect(event).toContain('Ana (p1) answered "3"');
+    expect(event).toContain('Bob (p2) answered "4"');
   });
 
-  it('does not inject a nudge after a single error', async () => {
-    seedSession(makeSession());
-
-    mockedChat
-      .mockResolvedValueOnce(toolCallResponse([{ name: 'bad_tool', args: {} }]))
-      .mockResolvedValueOnce(stopResponse());
-
-    await handleAction('session-1', 'player-1', 'nik', 'go');
-
-    const session = store.getSession('session-1')!;
-    const nudgeMessages = session.gameLlmMessages.filter(
-      (m) => m.role === 'user' && typeof m.content === 'string' && m.content.startsWith('SYSTEM:'),
-    );
-    expect(nudgeMessages).toHaveLength(0);
-  });
-});
-
-describe('game loop — non-interactive set_user_ui warning', () => {
-  it('still breaks the loop even when the UI has no interactive elements', async () => {
-    seedSession(makeSession());
-
-    // The loop should break after set_user_ui regardless of interactivity,
-    // so the LLM cannot overwrite non-interactive UIs either.
-    mockedChat
-      .mockResolvedValueOnce(toolCallResponse([{ name: 'set_user_ui', args: { playerId: 'all', ui: NON_INTERACTIVE_UI } }]))
-      .mockResolvedValueOnce(stopResponse()); // must NOT be called
-
-    await handleAction('session-1', 'player-1', 'nik', 'go');
-
+  it('ignores duplicate answers and inputs for an old turn', async () => {
+    await startWith({ screens: { all: QUESTION }, wait_for: 'all' });
+    await handlePlayerInput('session-1', 'p1', { kind: 'submit', id: 'answer', values: { answer: '3' }, turn: 1 });
+    await handlePlayerInput('session-1', 'p1', { kind: 'submit', id: 'answer', values: { answer: '4' }, turn: 1 });
+    await handlePlayerInput('session-1', 'p2', { kind: 'submit', id: 'answer', values: { answer: '4' }, turn: 0 });
+    expect(getSession().pendingTurn?.responses).toHaveLength(1);
     expect(mockedChat).toHaveBeenCalledTimes(1);
-    // Tool result should contain a warning
-    const toolResults = store.getSession('session-1')!.gameLlmMessages.filter((m) => m.role === 'tool');
-    const lastToolResult = JSON.parse(toolResults[toolResults.length - 1].content ?? '{}') as { warning?: string };
-    expect(lastToolResult.warning).toBeTruthy();
+  });
+
+  it('only the player with buttons can act in a per-player turn', async () => {
+    await startWith({
+      screens: {
+        all: [{ type: 'text', content: "Ana's turn" }],
+        p1: [{ type: 'text', content: 'Your turn' }, { type: 'button', label: 'Roll', actionId: 'roll' }],
+      },
+    });
+    expect(uiSentTo('p2')[0].ui[0]).toMatchObject({ content: "Ana's turn" });
+    expect(uiSentTo('p1')[0].ui[0]).toMatchObject({ content: 'Your turn' });
+
+    await handlePlayerInput('session-1', 'p2', { kind: 'action', id: 'roll', turn: 1 });
+    expect(mockedChat).toHaveBeenCalledTimes(1);
+    expect(mockedSendToPlayer.mock.calls.some(([, id, m]) => id === 'p2' && m.type === 'error')).toBe(true);
+  });
+
+  it('processes simultaneous inputs one at a time', async () => {
+    await startWith({ screens: { all: QUESTION } });
+    let inFlight = 0;
+    let maxInFlight = 0;
+    mockedChat.mockImplementation(async () => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 5));
+      inFlight--;
+      return nextTurn({ screens: { all: QUESTION } });
+    });
+    await Promise.all([
+      handlePlayerInput('session-1', 'p1', { kind: 'submit', id: 'answer', values: { answer: '3' }, turn: 1 }),
+      handlePlayerInput('session-1', 'p2', { kind: 'submit', id: 'answer', values: { answer: '4' }, turn: 1 }),
+    ]);
+    expect(maxInFlight).toBe(1);
+    // Bob's click was for turn 1, which Ana already ended → ignored
+    expect(mockedChat).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('timers', () => {
+  it('injects a countdown and sends a timeout event listing missing players', async () => {
+    vi.useFakeTimers();
+    await startWith({ screens: { all: QUESTION }, wait_for: 'all', timer_seconds: 10 });
+    expect(uiSentTo('p1')[0].ui[0]).toMatchObject({ type: 'countdown', seconds: 10 });
+
+    await handlePlayerInput('session-1', 'p1', { kind: 'submit', id: 'answer', values: { answer: '4' }, turn: 1 });
+    mockedChat.mockResolvedValueOnce(nextTurn({ screens: { all: NEXT_BUTTON } }));
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(mockedChat).toHaveBeenCalledTimes(2);
+    const event = mockedChat.mock.calls[1][0].messages.at(-1)!.content!;
+    expect(event).toContain('timer ran out');
+    expect(event).toContain('No response from: Bob');
+  });
+
+  it('cancels the timer when everyone answers in time', async () => {
+    vi.useFakeTimers();
+    await startWith({ screens: { all: QUESTION }, wait_for: 'all', timer_seconds: 10 });
+    mockedChat.mockResolvedValueOnce(nextTurn({ screens: { all: NEXT_BUTTON } }));
+    await handlePlayerInput('session-1', 'p1', { kind: 'submit', id: 'answer', values: { answer: '4' }, turn: 1 });
+    await handlePlayerInput('session-1', 'p2', { kind: 'submit', id: 'answer', values: { answer: '4' }, turn: 1 });
+    expect(mockedChat).toHaveBeenCalledTimes(2);
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(mockedChat).toHaveBeenCalledTimes(2); // no stale timeout event
+  });
+});
+
+describe('intro slides and game over', () => {
+  it('plays intro slides before the interactive screen', async () => {
+    vi.useFakeTimers();
+    store.saveSession(makeSession({ status: 'defining' }));
+    mockedChat.mockResolvedValueOnce(nextTurn({
+      intro: [
+        { screen: [{ type: 'text', content: 'France' }], seconds: 2 },
+        { screen: [{ type: 'text', content: 'Peru' }], seconds: 2 },
+      ],
+      screens: { all: QUESTION },
+    }));
+    const p = startGame('session-1');
+    await vi.advanceTimersByTimeAsync(5_000);
+    await p;
+    const uis = broadcastsOfType('ui_update').map(([, m]) => (m as { ui: Array<{ content?: string }> }).ui[0].content);
+    expect(uis).toEqual(['France', 'Peru']);
+    expect(uiSentTo('p1').at(-1)!.ui[0]).toMatchObject({ content: 'Question 1' });
+    expect(getSession().pendingTurn?.turn).toBe(1);
+  });
+
+  it('game_over finishes the session', async () => {
+    await startWith({ screens: { all: [{ type: 'text', content: 'Ana wins' }] }, game_over: { message: 'Ana wins!' } });
+    expect(getSession().status).toBe('finished');
+    expect(getSession().metrics?.finished).toBe(true);
+    expect(broadcastsOfType('status_change').at(-1)![1]).toMatchObject({ status: 'finished', message: 'Ana wins!' });
+  });
+});
+
+describe('host adjustments', () => {
+  it('interrupts the pending turn and records rule changes', async () => {
+    await startWith({ screens: { all: QUESTION }, wait_for: 'all' });
+    await handlePlayerInput('session-1', 'p1', { kind: 'submit', id: 'answer', values: { answer: '4' }, turn: 1 });
+    mockedChat.mockResolvedValueOnce(nextTurn({ screens: { all: QUESTION }, rule_change: '+3 per correct answer' }));
+    await handleGameTweak('session-1', 'Ana', '3 points per correct answer');
+
+    const event = mockedChat.mock.calls[1][0].messages.at(-1)!.content!;
+    expect(event).toContain('HOST ADJUSTMENT from Ana');
+    expect(event).toContain('Ana (p1) answered "4"');
+    expect(getSession().agreedRules).toContain('[AMENDMENT] +3 per correct answer');
+  });
+});
+
+describe('reset during an AI call', () => {
+  it('discards the result of a call that finishes after a reset', async () => {
+    await startWith({ screens: { all: QUESTION } });
+    let release!: () => void;
+    mockedChat.mockImplementationOnce(() => new Promise((resolve) => {
+      release = () => resolve(nextTurn({ screens: { all: NEXT_BUTTON } }));
+    }));
+    const p = handlePlayerInput('session-1', 'p1', { kind: 'submit', id: 'answer', values: { answer: '4' }, turn: 1 });
+    await vi.waitFor(() => expect(release).toBeDefined());
+    cancelAllTimers('session-1');
+    getSession().status = 'defining';
+    release();
+    await p;
+    expect(getSession().pendingTurn).toBeUndefined();
+    expect(uiSentTo('p1')).toHaveLength(1); // only the first screen
+  });
+});
+
+describe('json protocol', () => {
+  it('asks for schema-constrained JSON with only valid screen keys', async () => {
+    cfg.protocol = 'json';
+    store.saveSession(makeSession({ status: 'defining' }));
+    mockedChat.mockResolvedValueOnce(textReply(JSON.stringify({ screens: { all: QUESTION } })));
+    await startGame('session-1');
+
+    const request = mockedChat.mock.calls[0][0];
+    expect(request.tools).toBeUndefined();
+    const schema = request.responseSchema!.schema as { properties: { screens: { properties: object; additionalProperties: boolean } } };
+    expect(Object.keys(schema.properties.screens.properties)).toEqual(['all', 'p1', 'p2']);
+    expect(schema.properties.screens.additionalProperties).toBe(false);
+    expect(getSession().pendingTurn?.turn).toBe(1);
+    expect(getSession().gameLlmMessages.map((m) => m.role)).toEqual(['user', 'assistant', 'user']);
+    expect(getSession().gameLlmMessages.at(-1)!.content).toContain('Waiting for the first response from: Ana, Bob');
+  });
+
+  it('feeds validation problems back as a user message', async () => {
+    cfg.protocol = 'json';
+    store.saveSession(makeSession({ status: 'defining' }));
+    mockedChat
+      .mockResolvedValueOnce(textReply(JSON.stringify({ screens: { all: [{ type: 'image' }] } })))
+      .mockResolvedValueOnce(textReply(JSON.stringify({ screens: { all: QUESTION } })));
+    await startGame('session-1');
+    const retry = mockedChat.mock.calls[1][0].messages.at(-1)!;
+    expect(retry.role).toBe('user');
+    expect(retry.content).toContain('unknown type');
+    expect(getSession().gameLlmMessages.map((m) => m.role)).toEqual(['user', 'assistant', 'user']);
+  });
+});
+
+describe('intro slides followed by nothing to click', () => {
+  const slidesOnly = {
+    intro: [{ screen: [{ type: 'text', content: 'Japan' }], seconds: 1 }],
+    screens: { all: [{ type: 'text', content: 'Round 1' }] },
+  };
+
+  it('asks the AI for the next screen right after the slides', async () => {
+    vi.useFakeTimers();
+    store.saveSession(makeSession({ status: 'defining' }));
+    mockedChat
+      .mockResolvedValueOnce(nextTurn(slidesOnly))
+      .mockResolvedValueOnce(nextTurn({ screens: { all: QUESTION } }));
+    const p = startGame('session-1');
+    await vi.advanceTimersByTimeAsync(2_000);
+    await p;
+    expect(mockedChat).toHaveBeenCalledTimes(2);
+    expect(mockedChat.mock.calls[1][0].messages.at(-1)!.content).toContain('That screen has been shown');
+    expect(getSession().pendingTurn?.expected).toEqual(['p1', 'p2']);
+  });
+
+  it('does not allow two auto-continues in a row', async () => {
+    vi.useFakeTimers();
+    store.saveSession(makeSession({ status: 'defining' }));
+    mockedChat
+      .mockResolvedValueOnce(nextTurn(slidesOnly))
+      .mockResolvedValueOnce(nextTurn(slidesOnly))
+      .mockResolvedValueOnce(nextTurn({ screens: { all: QUESTION } }));
+    const p = startGame('session-1');
+    await vi.advanceTimersByTimeAsync(5_000);
+    await p;
+    // The second splash in a row is not auto-continued: it gets a Continue button instead
+    expect(mockedChat).toHaveBeenCalledTimes(2);
+    expect(uiSentTo('p1').at(-1)!.ui.at(-1)).toMatchObject({ type: 'button', actionId: 'continue' });
+    expect(getSession().pendingTurn).toBeDefined();
+  });
+});
+
+describe('server restart in the middle of an AI turn', () => {
+  it('marks the game as stalled so players get Retry, and tells reconnecting clients the AI is idle', async () => {
+    // State as persisted when the server died while waiting for the AI: playing, no pending turn
+    const session = makeSession({ playerUi: { p1: QUESTION as never, all: QUESTION as never } });
+    store.saveSession(session);
+    recoverInterruptedGames([getSession()]);
+    expect(getSession().stalled).toContain('restart');
+
+    resendState(getSession(), 'p1');
+    const toAna = mockedSendToPlayer.mock.calls.filter(([, id]) => id === 'p1').map(([, , m]) => m);
+    expect(toAna).toContainEqual({ type: 'ai_thinking', thinking: false });
+    expect(toAna.some((m) => m.type === 'game_error' && m.message)).toBe(true);
+
+    // Retry continues the game
+    mockedChat.mockResolvedValueOnce(nextTurn({ screens: { all: QUESTION } }));
+    await retryTurn('session-1', 'Ana');
+    expect(getSession().stalled).toBeUndefined();
+    expect(getSession().pendingTurn).toBeDefined();
+  });
+
+  it('leaves games that are waiting for players alone', async () => {
+    await startWith({ screens: { all: QUESTION } });
+    recoverInterruptedGames([getSession()]);
+    expect(getSession().stalled).toBeUndefined();
+  });
+});
+
+describe('host adjustment regenerates the screen', () => {
+  it('sends the adjustment to the AI and shows the new screen right away', async () => {
+    await startWith({ screens: { all: QUESTION } });
+    const withIdk = [{ type: 'multiple_choice', fieldId: 'answer', question: '2+2?', options: ['3', '4', "I don't know"] }];
+    mockedChat.mockResolvedValueOnce(nextTurn({ screens: { all: withIdk }, rule_change: 'Every question offers "I don\'t know"' }));
+    await handleGameTweak('session-1', 'Ana', 'add an option "I don\'t know"');
+    expect(uiSentTo('p1').at(-1)!.ui[0]).toMatchObject({ options: ['3', '4', "I don't know"] });
+    expect(getSession().pendingTurn?.turn).toBe(2);
+  });
+});
+
+describe('game plan bookkeeping', () => {
+  it('records answers per round/phase, counts rounds and adds the plan timer', async () => {
+    await startWith({
+      plan: { rounds: 2, phases: [{ id: 'answer', timer_seconds: 30 }, { id: 'reveal' }] },
+      phase: 'answer',
+      screens: { all: QUESTION },
+      wait_for: 'all',
+    });
+    expect(uiSentTo('p1')[0].ui[0]).toMatchObject({ type: 'countdown', seconds: 30 });
+
+    mockedChat.mockResolvedValueOnce(nextTurn({ phase: 'reveal', screens: { all: NEXT_BUTTON } }));
+    await handlePlayerInput('session-1', 'p1', { kind: 'submit', id: 'answer', values: { answer: '4' }, turn: 1 });
+    await handlePlayerInput('session-1', 'p2', { kind: 'submit', id: 'answer', values: { answer: '3' }, turn: 1 });
+
+    expect(getSession().gameState.answers).toEqual({ round1: { answer: { Ana: '4', Bob: '3' } } });
+    expect(getSession().gameState.progress).toMatchObject({ round: 1, phase: 'reveal' });
+    const event = mockedChat.mock.calls[1][0].messages.at(-1)!.content!;
+    expect(event).toContain('PLAN PROGRESS: round 1 of 2, current phase "answer"');
+
+    mockedChat.mockResolvedValueOnce(nextTurn({ phase: 'answer', screens: { all: QUESTION }, wait_for: 'all' }));
+    await handlePlayerInput('session-1', 'p1', { kind: 'action', id: 'next', turn: 2 });
+    expect(getSession().gameState.progress).toMatchObject({ round: 2, phase: 'answer' });
+  });
+});
+
+describe('after game over', () => {
+  it('a host adjustment reopens the game and shows the new screen', async () => {
+    await startWith({ screens: { all: [{ type: 'text', content: 'Ana wins' }] }, game_over: true, final_message: 'Ana wins' });
+    expect(getSession().status).toBe('finished');
+    mockedChat.mockResolvedValueOnce(nextTurn({ screens: { all: [{ type: 'text', content: 'Final scores per question' }] }, game_over: true, final_message: 'Ana wins 3-1' }));
+    await handleGameTweak('session-1', 'Ana', 'add a final screen with the score of each question');
+    expect(broadcastsOfType('status_change').map(([, m]) => (m as { status: string }).status)).toContain('playing');
+    expect(mockedChat.mock.calls[1][0].messages.at(-1)!.content).toContain('had already ended');
+    expect(uiSentTo('p1').at(-1)!.ui[0]).toMatchObject({ content: 'Final scores per question' });
+    expect(getSession().status).toBe('finished');
+  });
+});
+
+describe('answered notifications', () => {
+  it('tells the other players when someone answers, without changing their screen', async () => {
+    await startWith({ screens: { all: QUESTION }, wait_for: 'all', timer_seconds: 30 });
+    const bobScreensBefore = uiSentTo('p2').length;
+    await handlePlayerInput('session-1', 'p1', { kind: 'submit', id: 'answer', values: { answer: '4' }, turn: 1 });
+    const toBob = mockedSendToPlayer.mock.calls.filter(([, id]) => id === 'p2').map(([, , m]) => m);
+    expect(toBob).toContainEqual({ type: 'toast', text: 'Ana answered ✓' });
+    expect(uiSentTo('p2').length).toBe(bobScreensBefore);
+    // Ana's locked screen has no running timer any more
+    expect(uiSentTo('p1').at(-1)!.ui.some((c) => c.type === 'countdown')).toBe(false);
+  });
+});
+
+describe('answer keys', () => {
+  const quiz = [{ type: 'multiple_choice', fieldId: 'q1', question: 'Capital of France?', options: ['Paris', 'Rome'], correct: 'Paris', points: 2, penalty: -1 }];
+
+  it('never sends the right answer to the browsers', async () => {
+    await startWith({ screens: { all: quiz }, wait_for: 'all' });
+    const everything = JSON.stringify(mockedSendToPlayer.mock.calls);
+    expect(everything).not.toContain('answerKey');
+    expect(everything).not.toContain('"correct"');
+  });
+
+  it('gives instant feedback and points, and reports the check to the AI', async () => {
+    await startWith({ screens: { all: quiz }, wait_for: 'all' });
+    await handlePlayerInput('session-1', 'p1', { kind: 'submit', id: 'q1', values: { q1: 'Paris' }, turn: 1 });
+    expect(uiSentTo('p1').at(-1)!.ui.some((c) => c.type === 'text' && c.content.startsWith('✓ Correct! (+2)'))).toBe(true);
+    expect(getSession().gameState.scores).toEqual({ Ana: 2 });
+
+    mockedChat.mockResolvedValueOnce(nextTurn({ screens: { all: NEXT_BUTTON } }));
+    await handlePlayerInput('session-1', 'p2', { kind: 'submit', id: 'q1', values: { q1: 'Rome' }, turn: 1 });
+    expect(getSession().gameState.scores).toEqual({ Ana: 2, Bob: -1 });
+    const event = mockedChat.mock.calls[1][0].messages.at(-1)!.content!;
+    expect(event).toContain('Answer check for "q1" (right answer: Paris): Ana ✓ +2, Bob ✗ -1');
+  });
+
+  it('shows the verdict right away in a single-player turn too', async () => {
+    await startWith({ screens: { all: quiz } });
+    mockedChat.mockResolvedValueOnce(nextTurn({ screens: { all: NEXT_BUTTON } }));
+    await handlePlayerInput('session-1', 'p2', { kind: 'submit', id: 'q1', values: { q1: 'Rome' }, turn: 1 });
+    const bobScreens = uiSentTo('p2').map((m) => m.ui);
+    expect(bobScreens.some((ui) => ui.some((c) => c.type === 'text' && c.content === '✗ The answer was Paris (-1)'))).toBe(true);
+  });
+});
+
+describe('thinking ahead (prefetch)', () => {
+  const solo: Partial<Session> = { players: [{ id: 'p1', name: 'Ana', isHost: true, connectedAt: '' }] };
+
+  it('prepares the next screen when the only option is one button, and uses it', async () => {
+    process.env.LLM_PREFETCH = 'true';
+    mockedChat
+      .mockResolvedValueOnce(nextTurn({ screens: { all: NEXT_BUTTON } })) // first screen: just "Next"
+      .mockResolvedValueOnce(nextTurn({ screens: { all: QUESTION } })); // prefetched follow-up
+    store.saveSession(makeSession({ status: 'defining', ...solo }));
+    await startGame('session-1');
+    expect(mockedChat).toHaveBeenCalledTimes(2); // the second call started right away
+
+    await handlePlayerInput('session-1', 'p1', { kind: 'action', id: 'next', turn: 1 });
+    expect(mockedChat).toHaveBeenCalledTimes(2); // no new call: the prepared reply was used
+    expect(uiSentTo('p1').at(-1)!.ui[0]).toMatchObject({ content: 'Question 1' });
+    expect(getSession().metrics?.prefetchHits).toBe(1);
+  });
+
+  it('throws the prepared reply away when something else happens', async () => {
+    process.env.LLM_PREFETCH = 'true';
+    mockedChat
+      .mockResolvedValueOnce(nextTurn({ screens: { all: NEXT_BUTTON } }))
+      .mockResolvedValueOnce(nextTurn({ screens: { all: QUESTION } })) // prefetch (not used)
+      .mockResolvedValueOnce(nextTurn({ screens: { all: [{ type: 'text', content: 'Adjusted' }, ...NEXT_BUTTON] } }));
+    store.saveSession(makeSession({ status: 'defining', ...solo }));
+    await startGame('session-1');
+    await handleGameTweak('session-1', 'Ana', 'make it harder');
+    expect(mockedChat).toHaveBeenCalledTimes(4); // real call for the tweak (+ a new prefetch for its Next button)
+    expect(getSession().metrics?.prefetchMisses).toBe(1);
+    expect(uiSentTo('p1').some((m) => m.ui[0]?.type === 'text' && (m.ui[0] as { content: string }).content === 'Adjusted')).toBe(true);
+  });
+
+  it('does not think ahead when several outcomes are possible', async () => {
+    process.env.LLM_PREFETCH = 'true';
+    await startWith({ screens: { all: QUESTION } }); // a choice: many possible answers
+    expect(mockedChat).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('optional plan', () => {
+  it('does not require "plan" or "phase" in the JSON schema', async () => {
+    cfg.protocol = 'json';
+    store.saveSession(makeSession({ status: 'defining' }));
+    mockedChat.mockResolvedValueOnce(textReply(JSON.stringify({ plan: { rounds: 2, phases: ['q'] }, phase: 'q', screens: { all: QUESTION }, wait_for: 'all', game_over: false })));
+    await startGame('session-1');
+    expect((mockedChat.mock.calls[0][0].responseSchema!.schema as { required: string[] }).required).toEqual(['screens', 'wait_for', 'game_over']);
+    expect(getSession().gameState.progress).toMatchObject({ round: 1, phase: 'q' });
   });
 });

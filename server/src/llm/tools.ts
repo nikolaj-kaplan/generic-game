@@ -1,4 +1,5 @@
-import { LLMTool } from '../types';
+import { LLMTool, Player } from '../types';
+import type { GamePlan } from './plan';
 
 // =============================================================================
 // Definition-phase tools
@@ -10,231 +11,239 @@ export const definitionTools: LLMTool[] = [
     function: {
       name: 'propose_rules',
       description:
-        'Call this when you have a complete, unambiguous picture of the game rules. ' +
-        'Provide a structured summary that covers all mechanics, scoring, and win conditions. ' +
-        'The host will confirm before the game starts.',
+        'Propose the final rules once the game is clear. The host confirms before the game starts. ' +
+        'Write them with the GAME / PLAYERS / SETUP / ROUND FLOW / SCORING / END / NOTES template.',
       parameters: {
         type: 'object',
         properties: {
           summary: {
             type: 'string',
             description:
-              'A detailed, unambiguous description of the game rules. Be explicit about: ' +
-              'player count, turn order, all mechanics, scoring system, win conditions, and timing.',
+              'The complete rules, using the template headings. ' +
+              'ROUND FLOW must say what each player sees, whether players act at the same time or in turns, and any timers.',
           },
+          min_players: { type: 'number', description: 'Fewest players the game works with.' },
+          max_players: { type: 'number', description: 'Most players the game works with.' },
         },
-        required: ['summary'],
+        required: ['summary', 'min_players', 'max_players'],
       },
     },
   },
 ];
 
 // =============================================================================
-// Playing-phase tools
+// Playing phase: one next_turn per event
+//
+// Two protocols share the same schema:
+//   tools: next_turn is a tool, forced with tool_choice "required"
+//   json:  the reply itself must match the schema (response_format json_schema).
+//          Ollama enforces this with a grammar, so small local models cannot
+//          produce broken JSON.
+// The schema is built per session so the only allowed screen keys are "all"
+// and the real player ids.
 // =============================================================================
 
-const uiComponentSchema = {
-  type: 'array',
-  description:
-    'Array of UI components. Each element is one of: ' +
-    'text, input, button, multiple_choice, countdown, scoreboard, form, list, divider.',
-  items: { type: 'object' },
+const TEXT_AND_BUTTON_STYLES = ['heading', 'subheading', 'body', 'muted', 'success', 'error', 'primary', 'secondary', 'danger'];
+
+/**
+ * One flat schema for every component type. A flat object with optional fields
+ * is easier for small models (and more providers) than a oneOf per type.
+ */
+const componentSchema = {
+  type: 'object',
+  properties: {
+    type: {
+      type: 'string',
+      enum: ['text', 'multiple_choice', 'button', 'input', 'form', 'scoreboard', 'list', 'divider'],
+    },
+    content: { type: 'string', description: 'text: the text to show' },
+    style: {
+      type: 'string',
+      enum: TEXT_AND_BUTTON_STYLES,
+      description: 'text: heading | subheading | body | muted | success | error. button: primary | secondary | danger',
+    },
+    fieldId: { type: 'string', description: 'multiple_choice / input: key the answer is reported under' },
+    question: { type: 'string', description: 'multiple_choice: the question' },
+    options: {
+      type: 'array',
+      items: {
+        anyOf: [
+          { type: 'string' },
+          {
+            type: 'object',
+            properties: { label: { type: 'string' }, owner: { type: 'string', description: 'player id who wrote it; hidden from that player' } },
+            required: ['label'],
+          },
+        ],
+      },
+      description: 'multiple_choice: 2-6 options. Use {"label", "owner"} for answers written by players.',
+    },
+    correct: {
+      type: 'string',
+      description: 'multiple_choice: the right option (exactly as written in options). The server then shows each player instantly whether they were right and adds the points to state.scores.',
+    },
+    points: { type: 'number', description: 'multiple_choice with correct: points for a right answer (default 1).' },
+    penalty: { type: 'number', description: 'multiple_choice with correct: points for a wrong answer, e.g. -1 (default 0).' },
+    player_options: {
+      type: 'string',
+      enum: ['others', 'all'],
+      description: 'multiple_choice: instead of options, list the players ("others" = everyone except the viewer).',
+    },
+    label: { type: 'string', description: 'button / input: visible label' },
+    actionId: { type: 'string', description: 'button: id reported when clicked' },
+    placeholder: { type: 'string', description: 'input: hint text' },
+    formId: { type: 'string', description: 'form: id reported on submit' },
+    fields: {
+      type: 'array',
+      description: 'form: input components',
+      items: {
+        type: 'object',
+        properties: {
+          type: { type: 'string', enum: ['input'] },
+          fieldId: { type: 'string' },
+          label: { type: 'string' },
+          placeholder: { type: 'string' },
+        },
+        required: ['type', 'fieldId'],
+      },
+    },
+    submitLabel: { type: 'string', description: 'form: submit button label' },
+    players: {
+      type: 'array',
+      items: { type: 'object', properties: { name: { type: 'string' }, score: { type: 'number' } }, required: ['name', 'score'] },
+      description: 'scoreboard: one entry per player',
+    },
+    items: { type: 'array', items: { type: 'string' }, description: 'list: the items' },
+    ordered: { type: 'boolean', description: 'list: numbered or not' },
+  },
+  required: ['type'],
 };
 
-export const gameTools: LLMTool[] = [
-  {
-    type: 'function',
-    function: {
-      name: 'set_state_schema',
-      description:
-        'Define the JSON schema for the game state. Call this once when starting the game.',
-      parameters: {
+const screenSchema = { type: 'array', items: componentSchema };
+
+/** JSON schema for next_turn arguments, with the session's player ids as screen keys. */
+export function nextTurnSchema(players: Player[], plan?: GamePlan): Record<string, unknown> {
+  const screenProps: Record<string, unknown> = {
+    all: { ...screenSchema, description: 'Screen for everyone (unless a player has their own).' },
+  };
+  for (const p of players) {
+    screenProps[p.id] = { ...screenSchema, description: `Screen only for ${p.name}; overrides "all".` };
+  }
+  return {
+    type: 'object',
+    properties: {
+      state_update: {
         type: 'object',
-        properties: {
-          schema: {
-            type: 'object',
-            description: 'JSON Schema object describing the game state structure.',
-          },
+        description:
+          'Keys to set in the game state (merged into the current state; null deletes a key). ' +
+          'The state is your memory: store secrets, questions, answers, scores, round and turn.',
+      },
+      state_append: {
+        type: 'object',
+        description:
+          'Items to append to list keys in the state, e.g. {"history": [{"q": "Is it alive?", "a": "No"}]}. ' +
+          'Use this instead of resending a whole list in state_update.',
+      },
+      state_add: {
+        type: 'object',
+        description: 'Numbers to add to the state, e.g. {"scores": {"Ana": 2, "Bob": 1}}. Use this for points instead of computing totals.',
+      },
+      screens: {
+        type: 'object',
+        description: 'What players see now. "all" = everyone; a player id = a screen just for that player.',
+        properties: screenProps,
+        additionalProperties: false,
+      },
+      wait_for: {
+        type: 'string',
+        enum: ['any', 'all'],
+        description:
+          '"any" (default): next event as soon as one player responds. ' +
+          '"all": collect one response from every player who has something to click, then send them together.',
+      },
+      timer_seconds: {
+        type: 'number',
+        description: 'Optional countdown. When it runs out you get an event with the answers received so far.',
+      },
+      intro: {
+        type: 'array',
+        description: 'Optional timed slides shown to everyone before the screens (no input possible).',
+        items: {
+          type: 'object',
+          properties: { screen: screenSchema, seconds: { type: 'number' } },
+          required: ['screen', 'seconds'],
         },
-        required: ['schema'],
       },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'get_state',
-      description: 'Retrieve the current game state.',
-      parameters: {
-        type: 'object',
-        properties: {},
+      game_over: {
+        type: 'boolean',
+        description: 'true only when the end condition of the rules is reached in this turn; otherwise false.',
       },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'set_state',
-      description: 'Update the game state. Use merge:true to do a shallow merge instead of replacing.',
-      parameters: {
+      final_message: {
+        type: 'string',
+        description: 'Only with game_over true: the result, e.g. "Ana wins with 12 points!"',
+      },
+      rule_change: {
+        type: 'string',
+        description: 'Only when you accept a HOST ADJUSTMENT: a short description of the changed rule. Otherwise leave it out.',
+      },
+      plan: {
         type: 'object',
+        description:
+          'Optional game plan for games with rounds, usually written on the first turn: {"rounds": 3, "phases": [{"id": "answer", "description": "...", "timer_seconds": 30}, ...], "content": {...}}. ' +
+          'The server then counts rounds, applies phase timers and records answers.',
         properties: {
-          state: {
-            type: 'object',
-            description: 'The new (or partial, if merge=true) game state.',
-          },
-          merge: {
-            type: 'boolean',
-            description: 'If true, shallow-merge state into the existing state. Defaults to false.',
-          },
-        },
-        required: ['state'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'set_user_ui',
-      description:
-        'Push a UI to one player or all players. Use playerId "all" to target everyone.',
-      parameters: {
-        type: 'object',
-        properties: {
-          playerId: {
-            type: 'string',
-            description: 'Player ID to target, or "all" for everyone.',
-          },
-          ui: uiComponentSchema,
-        },
-        required: ['playerId', 'ui'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'run_sequence',
-      description:
-        'Execute a deterministic series of UI updates and state changes with delays between steps. ' +
-        'All steps are planned UPFRONT in one call — the server runs them automatically with no LLM call between steps. ' +
-        'Use this for: flashcard sequences, reveal animations, intro slides — any timed flow where you know every step in advance. ' +
-        'The game loop resumes AFTER the entire sequence finishes, so you can immediately follow up with set_user_ui for the next interaction. ' +
-        'delayBefore on step[0] = pause before the first item. delayBefore on step[N] = how long step[N-1] stays on screen.',
-      parameters: {
-        type: 'object',
-        properties: {
-          steps: {
+          rounds: { type: 'number' },
+          phases: {
             type: 'array',
-            description: 'Ordered steps to execute in sequence.',
             items: {
               type: 'object',
-              properties: {
-                action: {
-                  type: 'string',
-                  enum: ['set_ui', 'set_state'],
-                  description: 'set_ui: push UI components to a player. set_state: update game state.',
-                },
-                delayBefore: {
-                  type: 'number',
-                  description: 'Seconds to wait before executing this step. Default 0.',
-                },
-                playerId: {
-                  type: 'string',
-                  description: 'Required for set_ui. Player ID or "all".',
-                },
-                ui: {
-                  type: 'array',
-                  description: 'Required for set_ui. UI components array.',
-                  items: { type: 'object' },
-                },
-                state: {
-                  type: 'object',
-                  description: 'Required for set_state. State object to apply.',
-                },
-                merge: {
-                  type: 'boolean',
-                  description: 'For set_state: shallow-merge instead of replace. Default false.',
-                },
-              },
-              required: ['action'],
+              properties: { id: { type: 'string' }, description: { type: 'string' }, timer_seconds: { type: 'number' } },
+              required: ['id'],
             },
           },
+          content: { type: 'object', description: 'Content decided up front, e.g. secret words or questions per round.' },
         },
-        required: ['steps'],
+        required: ['rounds', 'phases'],
+      },
+      phase: plan
+        ? { type: 'string', enum: plan.phases.map((p) => p.id), description: 'The plan phase these screens belong to.' }
+        : { type: 'string', description: 'With a plan: the phase these screens belong to.' },
+      round: {
+        type: 'number',
+        description: 'With a plan: the round these screens belong to, when it differs from what PLAN PROGRESS assumes (e.g. the same question opens again after a wrong guess).',
       },
     },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'start_timer',
-      description:
-        'Start a countdown timer for player interactions that may time out (e.g. a 30-second answer window). ' +
-        'When it expires the server will feed a timer_expired event back to you. ' +
-        'Do NOT use this for deterministic sequences — use run_sequence instead.',
-      parameters: {
-        type: 'object',
-        properties: {
-          timerId: {
-            type: 'string',
-            description: 'Unique ID for this timer (e.g. "question-1").',
-          },
-          seconds: {
-            type: 'number',
-            description: 'Duration in seconds.',
-          },
-          playerId: {
-            type: 'string',
-            description: 'Player to notify on expiry, or "all". Defaults to "all".',
-          },
-        },
-        required: ['timerId', 'seconds'],
+    // Explicit decisions every turn: constrained decoding tends to fill optional
+    // fields with placeholders, so game_over is a required boolean.
+    required: ['screens', 'wait_for', 'game_over'],
+  };
+}
+
+export function gameToolsFor(players: Player[]): LLMTool[] {
+  return [
+    {
+      type: 'function',
+      function: {
+        name: 'next_turn',
+        description:
+          'Update the game state and show the next screen(s). Call this exactly once for every EVENT you receive.',
+        parameters: nextTurnSchema(players) as LLMTool['function']['parameters'],
       },
     },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'update_rules',
-      description:
-        'Record a mid-game rule amendment requested by the host. Call this when you accept a HOST ADJUSTMENT. ' +
-        'The amendment is appended to the agreed rules so it is visible in future turns.',
-      parameters: {
-        type: 'object',
-        properties: {
-          amendment: {
-            type: 'string',
-            description: 'A concise description of the rule change (e.g. "Scoring changed: +3 correct, -1 wrong").',
-          },
-        },
-        required: ['amendment'],
-      },
+  ];
+}
+
+/** json protocol, definition phase: a chat reply plus optional proposed rules. */
+export const definitionResponseSchema = {
+  type: 'object',
+  properties: {
+    message: { type: 'string', description: 'Your chat reply to the players (1-3 sentences).' },
+    proposed_rules: {
+      type: 'string',
+      description: 'The complete rules using the template, only when you propose them. Otherwise an empty string.',
     },
+    min_players: { type: 'number', description: 'With proposed rules: fewest players the game works with (else 0).' },
+    max_players: { type: 'number', description: 'With proposed rules: most players the game works with (else 0).' },
   },
-  {
-    type: 'function',
-    function: {
-      name: 'end_game',
-      description: 'Signal that the game is over and show results to all players.',
-      parameters: {
-        type: 'object',
-        properties: {
-          message: {
-            type: 'string',
-            description: 'End-of-game message to display (e.g. "Alice wins with 15 points!").',
-          },
-          results: {
-            type: 'object',
-            description: 'Structured results object (e.g. player scores, winner).',
-          },
-          ui: {
-            ...uiComponentSchema,
-            description: 'Optional final UI to display to all players.',
-          },
-        },
-        required: ['message', 'results'],
-      },
-    },
-  },
-];
+  required: ['message', 'proposed_rules', 'min_players', 'max_players'],
+};

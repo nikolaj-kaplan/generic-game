@@ -1,0 +1,8 @@
+{
+  "models": {
+    "local": { "baseUrl": "http://localhost:11434/v1", "model": "gemma4:26b-a4b-it-qat", "reasoningEffort": "none" },
+    "strong": { "baseUrl": "http://127.0.0.1:11435/v1", "model": "claude-bridge", "apiKeyEnv": "BRIDGE_API_KEY", "maxTokens": 16000 }
+  },
+  "complexity": { "1": "local", "2": "local", "3": "local", "4": "strong", "5": "strong" },
+  "generator": "strong"
+}

@@ -82,7 +82,7 @@ export function broadcast(sessionId: string, message: ServerMessage): void {
   }
 }
 
-/** Send a message to a specific player in a session. */
+/** Send a message to a specific player in a session (every tab they have open). */
 export function sendToPlayer(
   sessionId: string,
   playerId: string,
@@ -92,9 +92,6 @@ export function sendToPlayer(
   if (!connIds) return;
   for (const connId of connIds) {
     const conn = connections.get(connId);
-    if (conn?.playerId === playerId) {
-      send(conn.socket, message);
-      return;
-    }
+    if (conn?.playerId === playerId) send(conn.socket, message);
   }
 }

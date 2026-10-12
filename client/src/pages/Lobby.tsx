@@ -1,9 +1,9 @@
 import { useGame, useCurrentPlayer } from '../context/GameContext';
+import InviteCard from '../components/InviteCard';
 
 export default function Lobby() {
-  const { session, send, errorMessage, clearError } = useGame();
+  const { session, send, errorMessage, clearError, leaveSession } = useGame();
   const currentPlayer = useCurrentPlayer();
-
   if (!session) return null;
 
   const isHost = currentPlayer?.isHost ?? false;
@@ -19,8 +19,12 @@ export default function Lobby() {
           </div>
         </div>
 
+        <InviteCard joinCode={session.joinCode} />
+
         <p className="text-muted">
-          Share the code above with your friends. Once everyone has joined, the host starts the game.
+          {isHost
+            ? 'You can define the game now. Friends can join any time, also while you define it, and help in the chat.'
+            : 'Waiting for the host. You can help define the game once it starts.'}
         </p>
 
         {errorMessage && (
@@ -52,7 +56,7 @@ export default function Lobby() {
             onClick={() => send({ type: 'start_defining' })}
             disabled={session.players.length < 1}
           >
-            Start — define the game
+            Define the game
           </button>
         )}
 
@@ -61,6 +65,10 @@ export default function Lobby() {
             Waiting for the host to start…
           </p>
         )}
+
+        <button className="btn btn--secondary btn--full lobby-leave" onClick={leaveSession}>
+          Leave
+        </button>
       </div>
     </div>
   );

@@ -46,12 +46,15 @@ function ChatBubble({ message }: { message: ChatMessage }) {
   );
 }
 
-/** Minimal markdown renderer — only handles **bold** and newlines. */
+/** Minimal markdown renderer — only handles **bold**, *italic* and newlines. */
 function MarkdownText({ content }: { content: string }) {
-  const parts = content.split(/(\*\*[^*]+\*\*)/g);
+  const parts = content.split(/(\*\*[^*]+\*\*|\*[^*\n]+\*)/g);
   const nodes = parts.map((part, i) => {
-    if (part.startsWith('**') && part.endsWith('**')) {
+    if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
       return <strong key={i}>{part.slice(2, -2)}</strong>;
+    }
+    if (part.startsWith('*') && part.endsWith('*') && part.length > 2) {
+      return <em key={i}>{part.slice(1, -1)}</em>;
     }
     return (
       <span key={i}>
