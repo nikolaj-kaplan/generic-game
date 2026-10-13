@@ -19,7 +19,7 @@ export default function Lobby() {
           </div>
         </div>
 
-        <InviteCard joinCode={session.joinCode} />
+        <InviteCard joinCode={session.joinCode} players={session.players.map((p) => p.name)} />
 
         <p className="text-muted">
           {isHost

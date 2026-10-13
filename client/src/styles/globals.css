@@ -590,8 +590,16 @@ textarea.field__input {
   width: 7.5rem;
   height: 7.5rem;
   padding: 0.35rem;
+  border: 0;
   background: #fff; /* QR codes need a light background in dark mode too */
   border-radius: var(--radius-sm);
+  cursor: zoom-in;
+}
+
+.join-qr__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
 }
 
 .join-qr__code svg {
@@ -615,20 +623,82 @@ textarea.field__input {
   color: var(--accent-text);
 }
 
-/* Invite panel on the define page */
-.invite-panel {
-  padding: 0.5rem var(--gap) 0;
-  animation: rise-in 280ms var(--ease-out) both;
+/* Full-screen invite: a big QR code to hold up for others to scan */
+.invite-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 400;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: rgba(0, 0, 0, 0.55);
+  animation: fade-in 200ms ease both;
 }
 
-.invite-panel .join-qr {
-  margin: 0;
+.invite-popup {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 100%;
+  max-width: 380px;
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 1.25rem;
+  background: var(--surface);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sheet);
+  text-align: center;
+  animation: rise-in 250ms var(--ease-out) both;
 }
 
-.invite-panel__players {
-  margin: 0.5rem 0.25rem 0;
+.invite-popup__title {
+  margin: 0 0 0.75rem;
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.invite-popup__qr {
+  width: min(100%, 300px);
+  aspect-ratio: 1;
+  padding: 0.6rem;
+  background: #fff; /* QR codes need a light background in dark mode too */
+  border-radius: var(--radius);
+}
+
+.invite-popup__qr svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.invite-popup__label {
+  margin: 0.9rem 0 0.1rem;
   font-size: 0.875rem;
   color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.invite-popup__code {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 2.25rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: var(--accent-text);
+}
+
+.invite-popup__players {
+  margin: 0.5rem 0 0;
+  font-size: 0.875rem;
+  color: var(--text-muted);
+}
+
+.invite-popup__actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1rem;
 }
 
 /* Saved games on the define page */

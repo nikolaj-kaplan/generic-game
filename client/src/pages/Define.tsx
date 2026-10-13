@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useGame, useCurrentPlayer } from '../context/GameContext';
 import Chat from '../components/Chat';
-import InviteCard from '../components/InviteCard';
+import { InvitePopup } from '../components/InviteCard';
 import { GAME_PRESETS } from '../data/presets';
 import { deleteSavedGame, loadSavedGames, rangeLabel, SavedGame } from '../data/savedGames';
 import { useConfirm } from '../components/ConfirmDialog';
@@ -66,9 +66,9 @@ export default function Define() {
         <span className="chat-header__title">🎮 Define your game</span>
         <div className="chat-header__actions">
           <button
-            className={`btn btn--sm ${showInvite ? 'btn--primary' : 'btn--secondary'}`}
-            onClick={() => setShowInvite((v) => !v)}
-            title="Let friends join now, while you define the game"
+            className="btn btn--sm btn--secondary"
+            onClick={() => setShowInvite(true)}
+            title="Show the QR code so friends can join now, while the game is defined"
           >
             👥 {playerCount} · Invite
           </button>
@@ -88,12 +88,7 @@ export default function Define() {
       </header>
 
       {showInvite && session && (
-        <div className="invite-panel">
-          <InviteCard joinCode={session.joinCode} />
-          <p className="invite-panel__players">
-            Here: {session.players.map((p) => p.name).join(', ')}
-          </p>
-        </div>
+        <InvitePopup joinCode={session.joinCode} players={session.players.map((p) => p.name)} onClose={() => setShowInvite(false)} />
       )}
 
       {isAiThinking && (
