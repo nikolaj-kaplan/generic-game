@@ -11,6 +11,7 @@
     "playtest": "tsx scripts/playtest.ts",
     "transcript": "tsx scripts/transcript.ts",
     "bridge": "tsx scripts/llm-bridge.ts",
+    "bridge:claude": "tsx scripts/bridge-claude.ts",
     "bridge:show": "tsx scripts/bridge-show.ts",
     "codegen:eval": "tsx scripts/codegen-eval.ts",
     "play:program": "tsx scripts/play-program.ts"
