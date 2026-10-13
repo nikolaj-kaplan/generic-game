@@ -132,7 +132,7 @@ Rules:
 Rules:
 - Each round the AI picks a well-known band and shows its name to everyone with all vowels (A, E, I, O, U) and all spaces removed, e.g. "Pink Floyd" becomes "PNKFLYD".
 - Everyone sees an "I know!" button and a "Give up!" button. The first player to press "I know!" gets to guess; the other players see who is guessing.
-- If anyone presses "Give up!", nobody knows it: reveal the band name, no points change, and go to the next round with a new band.
+- "Give up!" counts per player: everyone sees how many have given up (e.g. "2 of 3 gave up"). A player who gave up can still press "I know!". Only when every player has pressed "Give up!" is the band name revealed; then no points change and the game goes to the next round with a new band. With 1 player, "Give up!" skips at once.
 - The guessing player has 30 seconds to type the band name, or press "Give up".
 - Correct guess: +1 point. Small spelling mistakes are fine. Wrong guess, giving up or running out of time: -1 point.
 - After a correct guess, show the full band name and the scores, then go to the next round with a new band.

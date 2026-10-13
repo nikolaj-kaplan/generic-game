@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { allPresetPrograms } from '../presets';
+import { allPresetPrograms, presetProgram } from '../presets';
 import { runDispatch, describeProgram, EnginePlayer, DispatchOutput } from '../sandbox';
 import { botPlayers, fakeAi } from '../botTest';
 import { checkProgramSource } from '../typecheck';
@@ -29,6 +29,23 @@ describe('preset programs', () => {
       expect(result.problems).toEqual([]);
     }, 60_000);
   }
+
+  it('band-buzzer skips a round only when every player gave up', async () => {
+    const { code } = presetProgram('band-buzzer');
+    const giveUp = { kind: 'action' as const, id: 'giveUp' };
+    let out = await start(code);
+    expect(out.engine.phase).toBe('buzz');
+    out = await send(code, out, ana, giveUp);
+    out = await send(code, out, ana, giveUp); // again: still one vote
+    expect(out.engine.phase).toBe('buzz');
+    expect(texts(out, bob)).toContain('1 of 3 gave up');
+    expect(texts(out, ana)).toContain('You gave up. You can still press "I know!" if it comes to you.');
+    out = await send(code, out, bob, giveUp);
+    expect(out.engine.phase).toBe('buzz');
+    out = await send(code, out, cleo, giveUp);
+    expect(out.engine.phase).toBe('reveal');
+    expect(texts(out, ana)).toContain('Everyone gave up. No points this round.');
+  });
 });
 
 describe('sandbox', () => {
@@ -138,6 +155,40 @@ describe('shapes', () => {
     expect(coerce({ a: ['Yes', 'No'], n: 'number' }, { a: 'yes', n: '3' })).toEqual({ a: 'Yes', n: 3 });
     expect(() => coerce('string[4]', ['a'])).toThrow(/4 items/);
   });
+});
+
+describe('bot test', () => {
+  // Like Band Buzzer's give-up rule: the game ends only when every player presses Stop
+  // in a row. Bots that mostly press the first button never get there.
+  const allMustStop = `defineGame({
+    start: 'ask',
+    setup(g) { g.state.stops = []; },
+    phases: {
+      ask: buzzer({
+        view: () => [ui.text('Stop?')],
+        buttons: { again: 'Again', stop: 'Stop' },
+        next(g, press) {
+          if (!press || press.button === 'again') { g.state.stops = []; return 'ask'; }
+          if (!g.state.stops.includes(press.player)) g.state.stops.push(press.player);
+          return g.state.stops.length === g.ids.length ? g.end('Everyone stopped') : 'ask';
+        },
+      }),
+    },
+  });`;
+
+  it('accepts a game that ends only when players choose to stop', async () => {
+    const { botTest } = await import('../botTest');
+    const report = await botTest(allMustStop, { min: 4, max: 4 }, { runs: 6 });
+    expect(report.runs.some((r) => r.endless)).toBe(true);
+    expect(report.problems).toEqual([]);
+  }, 60_000);
+
+  it('rejects a game no bot can end', async () => {
+    const { botTest } = await import('../botTest');
+    const never = allMustStop.replace("g.end('Everyone stopped')", "'ask'");
+    const report = await botTest(never, { min: 2, max: 2 }, { runs: 3 });
+    expect(report.problems.join('\n')).toMatch(/did not end/);
+  }, 60_000);
 });
 
 describe('generator', () => {

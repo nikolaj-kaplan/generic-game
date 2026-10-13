@@ -7,13 +7,21 @@ import type { UIComponent } from '../types';
 // Timers fire instantly and g.ai returns fake data of the right shape, so no
 // model and no browser are involved. Finds crashes, games that never end,
 // screens nobody can act on and phases that are never reached.
+//
+// Bots play in different styles (mostly the first button, mostly the last,
+// anything). Some rules only end a round when players choose to stop, e.g.
+// "skip when everyone gave up": random bots that keep buzzing never get there.
+// So a game counts as never ending only when no style could end it.
 // =============================================================================
 
 const NAMES = ['Ana', 'Bob', 'Cleo', 'Dev', 'Eli', 'Fay', 'Gus', 'Hana'];
 
 export interface BotRun {
   players: number;
+  style: BotStyle;
   finished: boolean;
+  /** Still running after the step limit (not a crash). */
+  endless?: boolean;
   steps: number;
   error?: string;
   phases: string[];
@@ -61,12 +69,18 @@ export function fakeAi(rand: () => number, counts?: Record<string, number>) {
   };
 }
 
+export type BotStyle = 'first' | 'last' | 'any';
+const STYLES: BotStyle[] = ['first', 'last', 'any'];
+
+/** Let the server handle sockets and timers between bot steps (the sandbox never waits on I/O). */
+const breathe = () => new Promise<void>((resolve) => setImmediate(resolve));
+
 const RANDOM_TEXT = ['Paris', 'blue', 'A very long answer that goes on for a while', 'pizza', '', 'Mock item 1', '42'];
 
 /** A random input a player could send from this screen, or null if there is nothing to do. */
 type PlayerInput = { kind: 'action' | 'submit'; id: string; values?: Record<string, string> };
 
-function randomInput(screen: UIComponent[], rand: () => number): PlayerInput | null {
+function randomInput(screen: UIComponent[], rand: () => number, style: BotStyle): PlayerInput | null {
   const choices = screen.filter((c): c is Extract<UIComponent, { type: 'multiple_choice' }> => c.type === 'multiple_choice');
   if (choices.length) {
     const c = choices[0];
@@ -75,8 +89,9 @@ function randomInput(screen: UIComponent[], rand: () => number): PlayerInput | n
   const inputs = screen.filter((c): c is Extract<UIComponent, { type: 'input' }> => c.type === 'input');
   const buttons = screen.filter((c): c is Extract<UIComponent, { type: 'button' }> => c.type === 'button');
   if (!buttons.length) return null;
-  // Mostly the main (first) button, sometimes another one.
-  const button = rand() < 0.7 ? buttons[0] : buttons[Math.floor(rand() * buttons.length)];
+  // Mostly the first (or last) button, sometimes another one.
+  const favourite = style === 'first' ? buttons[0] : style === 'last' ? buttons[buttons.length - 1] : null;
+  const button = favourite && rand() < 0.7 ? favourite : buttons[Math.floor(rand() * buttons.length)];
   if (!inputs.length) return { kind: 'action', id: button.actionId };
   const values: Record<string, string> = {};
   for (const i of inputs) values[i.fieldId] = RANDOM_TEXT[Math.floor(rand() * RANDOM_TEXT.length)];
@@ -113,8 +128,9 @@ export async function playOnce(
   program: string,
   players: EnginePlayer[],
   seed: number,
-  options: { maxSteps?: number; from?: EngineState; aiCounts?: Record<string, number> } = {},
+  options: { maxSteps?: number; from?: EngineState; aiCounts?: Record<string, number>; style?: BotStyle } = {},
 ): Promise<BotRun> {
+  const style = options.style ?? 'first';
   const rand = rng(seed);
   const ai = fakeAi(rand, options.aiCounts);
   const phases = new Set<string>();
@@ -124,10 +140,11 @@ export async function playOnce(
     aiCalls++;
     return ai(req);
   };
-  const run: BotRun = { players: players.length, finished: false, steps: 0, phases: [], aiCalls: 0 };
+  const run: BotRun = { players: players.length, style, finished: false, steps: 0, phases: [], aiCalls: 0 };
   try {
     let out = await runDispatch(program, { engine: options.from ?? null, players, event: options.from ? { type: 'render' } : { type: 'start' }, seed }, { ai: countingAi });
     for (; run.steps < maxSteps; run.steps++) {
+      await breathe();
       if (out.engine.phase) phases.add(out.engine.phase);
       const bad = checkScreens(out, players);
       if (bad) throw new ProgramError(bad);
@@ -142,7 +159,7 @@ export async function playOnce(
         event = { type: 'timer', turn: out.timer.turn };
       } else if (waiting.length) {
         const who = waiting[Math.floor(rand() * waiting.length)];
-        const input = randomInput(out.screens[who] ?? [], rand);
+        const input = randomInput(out.screens[who] ?? [], rand, style);
         if (input) event = { type: 'input', playerId: who, turn: out.engine.turn, input };
       }
       if (!event) {
@@ -155,6 +172,7 @@ export async function playOnce(
       }
     }
     if (!run.finished) {
+      run.endless = true;
       throw new ProgramError(`The game did not end after ${maxSteps} player actions (stuck around phase "${out.engine.phase}", round ${out.engine.round}).`);
     }
   } catch (err) {
@@ -181,14 +199,29 @@ export async function botTest(
   const total = options.runs ?? 20;
   const lo = Math.max(1, range.min);
   const hi = Math.max(lo, Math.min(8, range.max));
+  const sizes = hi - lo + 1;
   for (let i = 0; i < total; i++) {
-    const n = lo + (i % (hi - lo + 1));
+    const n = lo + (i % sizes);
     const players = options.players ?? botPlayers(n);
-    runs.push(await playOnce(program, players, 1000 + i * 7919, { from: options.from, aiCounts: counts }));
+    const style = STYLES[Math.floor(i / sizes) % STYLES.length];
+    runs.push(await playOnce(program, players, 1000 + i * 7919, { from: options.from, aiCounts: counts, style }));
   }
+  // Before calling a game endless, let the styles not yet tried with that many players have a go.
+  for (const n of new Set(runs.filter((r) => r.endless).map((r) => r.players))) {
+    for (const style of STYLES) {
+      const same = runs.filter((r) => r.players === n);
+      if (same.some((r) => r.finished)) break;
+      if (same.some((r) => r.style === style)) continue;
+      const players = options.players ?? botPlayers(n);
+      runs.push(await playOnce(program, players, 99_991 + n * 31, { from: options.from, aiCounts: counts, style }));
+    }
+  }
+  // A game that never ended only counts when no run with that many players ended.
+  const ended = new Set(runs.filter((r) => r.finished).map((r) => r.players));
   const problems: string[] = [];
   const seen = new Set<string>();
   for (const r of runs) {
+    if (r.endless && ended.has(r.players)) continue;
     if (r.error && !seen.has(r.error)) {
       seen.add(r.error);
       problems.push(`${r.error} (with ${r.players} player${r.players === 1 ? '' : 's'})`);

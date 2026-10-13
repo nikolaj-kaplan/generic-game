@@ -136,12 +136,16 @@ export async function chat(options: ChatOptions): Promise<LLMResponse> {
     };
     if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
 
-    const res = await fetch(config.url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: options.signal,
-    });
+    const send = () => fetch(config.url, { method: 'POST', headers, body: JSON.stringify(body), signal: options.signal });
+    let res: Response;
+    try {
+      res = await send();
+    } catch (err) {
+      // A pooled connection the server already closed fails at once ("fetch failed",
+      // ECONNRESET). Nothing was sent, so one retry on a fresh connection is safe.
+      if (options.signal?.aborted || !(err instanceof TypeError)) throw err;
+      res = await send();
+    }
 
     if (!res.ok) {
       const text = await res.text();
